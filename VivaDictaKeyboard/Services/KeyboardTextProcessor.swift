@@ -81,7 +81,8 @@ final class KeyboardTextProcessor {
         }
     }
 
-    /// 把光标前全部内容翻成日语，并原位替换（2026-10-30 起不再只翻最后一句）。
+    /// 把光标前全部内容翻成日语，并原位替换（2026-10-30 起不再只翻最后一句，
+    /// 2026-11-03 起不再只翻宿主给的那一段，改走整框读取）。
     ///
     /// 与 ``processText(proxy:mode:presetId:dictationState:)`` 的区别只剩走 AppGroup
     /// 通知等主 App 回结果；读取范围与那边一致：选中文本优先，否则光标前全部文本。
@@ -139,8 +140,8 @@ final class KeyboardTextProcessor {
     /// 直接拿 App Group 快照里的模型和 Key 调接口。主 App 没在后台活着
     /// 也能翻；代价是键盘联网要求“允许完全访问”，没开时请求失败会进
     /// error 分支给一句人话提示，不再静默转圈。目标固定日语。
-    /// 翻译目标是光标前全部内容（2026-10-30 起不再只翻最后一句）；
-    /// 选中文本时只翻选中的部分。
+    /// 翻译目标是光标前全部内容（2026-10-30 起不再只翻最后一句；2026-11-03
+    /// 起不再只翻宿主给的那一段，改走整框读取）；选中文本时只翻选中的部分。
     func translateCurrentTextDirectly(
         proxy: UITextDocumentProxy,
         dictationState: KeyboardDictationState
@@ -201,13 +202,47 @@ final class KeyboardTextProcessor {
     }
 
     /// 翻译目标：选中文本优先（翻选中的全部），否则光标前全部文本。
-    /// 2026-10-30 前这里只取“最后一句”（按 。！？ 等句末标点切分），
-    /// 用户要求整框内容都翻，改成全量。替换时按目标字数往前删，字数
-    /// 必须与原文一致，因此这里不 trim 原文（只用 trim 判空），避免删错范围。
+    ///
+    /// 2026-10-30 前这里只取“最后一句”（按 。！？ 等句末标点切分），之后改成
+    /// “光标前一段”。但 `documentContextBeforeInput` 给多长由宿主定，长输入时
+    /// 只有尾巴那一段，于是长文本仍只翻后面一小截（2026-11-03 再报）。现在先走
+    /// ``TextDocumentProxyReader/readWholeTextBeforeCursor(from:)`` 把整段走完，
+    /// 只有宿主不配合移动光标时才回落到“光标前一段”。
+    ///
+    /// 替换时按目标字数往前删，字数必须与原文一致，因此这里不 trim 原文（只用
+    /// trim 判空），避免删错范围；整框读成功时光标已退回原处，删的正好是整框。
     private func readTranslateTarget(
         from proxy: UITextDocumentProxy,
         dictationState: KeyboardDictationState
     ) -> Target? {
+        // 框选优先：用户框了哪段就翻哪段，不动框外。
+        if let selected = proxy.selectedText,
+           !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            logger.logInfo("📝 [TextProcessor] Translating selection (\(selected.count) chars)")
+            return Target(text: selected, isSelection: true)
+        }
+
+        // 整框：光标前全部文字（宿主默认只给紧贴光标的一段）。
+        switch TextDocumentProxyReader.readWholeTextBeforeCursor(from: proxy) {
+        case .whole(let whole):
+            guard !whole.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return noTextError(dictationState: dictationState)
+            }
+            logger.logInfo("📝 [TextProcessor] Translating whole text before cursor (\(whole.count) chars)")
+            return Target(text: whole, isSelection: false)
+        case .unavailable:
+            break
+        case .cursorLost:
+            // 光标被留在半路：这时不能回落（会按字数删错地方），直接放弃这一单。
+            HapticManager.error()
+            dictationState.textProcessingPhase = .error("没法定位光标，这次翻译已取消：点一下输入框再试")
+            autoDismissError(dictationState: dictationState)
+            return nil
+        }
+
+        // 回落：宿主不认光标移动，读到的“光标前一段”就是这次能拿到的全部。
+        // readWholeTextBeforeCursor 已把光标退回原位，所以这里读到的仍是原来位置那一段。
+        logger.logInfo("📝 [TextProcessor] Whole-text walk unavailable — falling back to the host's before-cursor chunk")
         switch TextDocumentProxyReader.readText(from: proxy) {
         case .selectedText(let text):
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -218,7 +253,7 @@ final class KeyboardTextProcessor {
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return noTextError(dictationState: dictationState)
             }
-            logger.logInfo("📝 [TextProcessor] Translating full text before cursor (\(text.count) chars)")
+            logger.logInfo("📝 [TextProcessor] Translating host chunk from before the cursor (\(text.count) chars)")
             return Target(text: text, isSelection: false)
         case .empty:
             return noTextError(dictationState: dictationState)

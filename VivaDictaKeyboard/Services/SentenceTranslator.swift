@@ -2,12 +2,16 @@ import AICore
 import Foundation
 import os
 
-/// 键盘端直译：把光标前全部中文发给 OpenAI 兼容接口，换回日语。
+/// 键盘端直译：把光标前全部文字发给 OpenAI 兼容接口，换回日语。
 ///
 /// 只用在九宫格的星星「译」上：组字串先上屏，取光标前全部内容 → 发请求 →
 /// 译文就地替换原文。不再走“发通知等主 App 回结果”那条路，所以主 App
 /// 没在后台活着也能翻；代价是键盘扩展里联网要求「允许完全访问」，
 /// 没开时请求会失败，调用方按失败处理（给一句人话报错，不再静默转圈）。
+///
+/// 整框翻译是常态，超过 ``chunkLimit`` 就按句末标点切段、逐段请求、按顺序
+/// 拼回：一次塞太长的正文，模型会自己压缩或截断，接口也有 max tokens 上限。
+/// 任何一段失败整次就失败，不写回半截译文。
 ///
 /// 配置只读主 App 同步到 App Group 的快照（`SharedAIConfig`，和主 App
 /// 选中模式共用同一个 key，不另配）。没有 key 就整体关闭，返回 nil。
@@ -32,6 +36,12 @@ actor SentenceTranslator {
     )
     private static let cacheLimit = 128
 
+    /// 单次请求的字数上限。段内是一整句到几句话，模型译得稳，也不容易撞
+    /// 接口的 max tokens；切段只在句末标点/换行处下刀，不切在句子中间。
+    private static let chunkLimit = 1_200
+    /// 攒到这么多字才肯切，避免一堆碎段（一句一请求又慢又贵）。
+    private static let softLimit = 600
+
     private var cache: [String: String] = [:]
     private var recency: [String] = []
     private var inFlight: [String: Task<String?, Never>] = [:]
@@ -44,8 +54,9 @@ actor SentenceTranslator {
         session = URLSession(configuration: configuration)
     }
 
-    /// 拿一句译文；`nil` 表示没配 key、网络失败、超时、或返回内容为空。
-    /// 译按钮一次点击只翻一句，30 秒超时比自动译文卡片宽松得多。
+    /// 拿一段译文；`nil` 表示没配 key、网络失败、超时、或返回内容为空。
+    /// 译按钮一次点击翻整框：超过 ``chunkLimit`` 自动切段，逐段请求，
+    /// 任何一段失败就整体失败（调用方按失败提示，不写回半截译文）。
     func translate(_ text: String) async -> String? {
         let source = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard source.count >= 2 else { return nil }
@@ -55,7 +66,16 @@ actor SentenceTranslator {
 
         let session = self.session
         let task = Task<String?, Never> { [config] in
-            await Self.perform(source, config: config, session: session)
+            let pieces = Self.split(source)
+            var translated: [String] = []
+            translated.reserveCapacity(pieces.count)
+            for piece in pieces {
+                guard let one = await Self.perform(piece, config: config, session: session) else {
+                    return nil
+                }
+                translated.append(one)
+            }
+            return translated.joined(separator: "\n")
         }
         inFlight[source] = task
         let result = await task.value
@@ -64,6 +84,39 @@ actor SentenceTranslator {
             store(source, result)
         }
         return result
+    }
+
+    // MARK: - 切段
+
+    /// 把正文切成能一次请求的几段：只在句末标点或换行处下刀，攒够
+    /// ``softLimit`` 才切，单句超过 ``chunkLimit`` 才硬切（不丢字）。
+    /// 纯函数，不碰网络，便于单测。
+    static func split(_ text: String) -> [String] {
+        guard text.count > chunkLimit else { return [text] }
+
+        var pieces: [String] = []
+        var current = ""
+
+        func flush() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { pieces.append(trimmed) }
+            current = ""
+        }
+
+        for character in text {
+            current.append(character)
+            let isBoundary = character == "\n" || "。！？!?；;…".contains(character)
+            if isBoundary, current.count >= softLimit {
+                flush()
+            } else if current.count >= chunkLimit {
+                // 一整句长到上限还没遇到标点：硬切，字一个都不丢。
+                pieces.append(current)
+                current = ""
+            }
+        }
+        flush()
+
+        return pieces.isEmpty ? [text] : pieces
     }
 
     private func store(_ source: String, _ translation: String) {
@@ -171,6 +224,8 @@ actor SentenceTranslator {
         }
         return """
         你是输入法里的翻译器。把用户给出的中文译成自然的\(language)，口语优先，长度与原文相当。
+        输入可能是几段：按原文顺序逐段译，段与段之间保留换行，不合并不省略任何一段。
+        原文里已经是\(language)的部分原样保留，不用重译。
         只输出译文本身：不要解释，不要加引号，不要罗马字或假名注音。
         """
     }
