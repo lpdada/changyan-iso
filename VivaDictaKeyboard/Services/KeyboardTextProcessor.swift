@@ -117,13 +117,16 @@ final class KeyboardTextProcessor {
 
                 dictationState.textProcessingPhase = .sendingToApp
 
+                // 标签先在闭包外算好：awaitResult 的请求闭包不是 MainActor 隔离的，
+                // 在里面调实例方法会隐式捕获 self，Swift 6 编译不过。
+                let label = sourceLabel(for: target)
                 let translated = try await awaitResult(dictationState: dictationState) {
                     AppGroupCoordinator.shared.requestTextProcessing(
                         text: target.text,
                         modeName: mode.name,
                         presetId: presetId
                     )
-                    dictationState.textProcessingPhase = .waitingForResult(modeName: sourceLabel(for: target))
+                    dictationState.textProcessingPhase = .waitingForResult(modeName: label)
                 }
 
                 try Task.checkCancellation()
