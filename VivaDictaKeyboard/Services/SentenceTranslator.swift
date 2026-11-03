@@ -2,9 +2,9 @@ import AICore
 import Foundation
 import os
 
-/// 键盘端直译：把光标前全部中文发给 OpenAI 兼容接口，换回日语。
+/// 键盘端直译：把输入框全部中文发给 OpenAI 兼容接口，换回日语。
 ///
-/// 只用在九宫格的星星「译」上：组字串先上屏，取光标前全部内容 → 发请求 →
+/// 只用在九宫格的星星「译」上：组字串先上屏，取输入框全部内容 → 发请求 →
 /// 译文就地替换原文。不再走“发通知等主 App 回结果”那条路，所以主 App
 /// 没在后台活着也能翻；代价是键盘扩展里联网要求「允许完全访问」，
 /// 没开时请求会失败，调用方按失败处理（给一句人话报错，不再静默转圈）。
@@ -44,8 +44,8 @@ actor SentenceTranslator {
         session = URLSession(configuration: configuration)
     }
 
-    /// 拿一句译文；`nil` 表示没配 key、网络失败、超时、或返回内容为空。
-    /// 译按钮一次点击只翻一句，30 秒超时比自动译文卡片宽松得多。
+    /// 拿一段译文；`nil` 表示没配 key、网络失败、超时、或返回内容为空。
+    /// 译按钮一次点击翻整框，30 秒超时比自动译文卡片宽松得多。
     func translate(_ text: String) async -> String? {
         let source = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard source.count >= 2 else { return nil }

@@ -224,7 +224,7 @@ struct KeyboardCustomView: View {
                                     guard let vc = keyboardVC else { return }
                                     // 九宫格星星「译」走键盘端直译：直接拿主 App 同步到
                                     // App Group 的快照调模型，不再等主 App 回结果；
-                                    // 翻的是光标前全部内容，不再只翻最后一句。
+                                    // 翻的是输入框全部内容，不再只翻最后一句、也不再只翻宿主给的那一段。
                                     vc.textProcessor.translateCurrentTextDirectly(
                                         proxy: vc.textDocumentProxy,
                                         dictationState: dictationState
