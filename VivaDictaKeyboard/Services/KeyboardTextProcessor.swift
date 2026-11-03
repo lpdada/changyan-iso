@@ -105,14 +105,16 @@ final class KeyboardTextProcessor {
             return
         }
 
-        guard let target = readTranslateTarget(from: proxy, dictationState: dictationState) else { return }
-
         cancel()
 
         isProcessing = true
         currentTask = Task {
             defer { isProcessing = false }
             do {
+                // 读文本放在 Task 里：整框读取要等宿主把光标挪动后的内容递上来，
+                // 不能同步阻塞这次点按。
+                guard let target = try await readTranslateTarget(from: proxy, dictationState: dictationState) else { return }
+
                 dictationState.textProcessingPhase = .sendingToApp
 
                 let translated = try await awaitResult(dictationState: dictationState) {
@@ -121,7 +123,7 @@ final class KeyboardTextProcessor {
                         modeName: mode.name,
                         presetId: presetId
                     )
-                    dictationState.textProcessingPhase = .waitingForResult(modeName: mode.name)
+                    dictationState.textProcessingPhase = .waitingForResult(modeName: sourceLabel(for: target))
                 }
 
                 try Task.checkCancellation()
@@ -151,21 +153,23 @@ final class KeyboardTextProcessor {
             return
         }
 
-        guard let target = readTranslateTarget(from: proxy, dictationState: dictationState) else { return }
-
-        guard target.text.count >= 2 else {
-            HapticManager.error()
-            dictationState.textProcessingPhase = .error("内容太短，没什么可翻的")
-            autoDismissError(dictationState: dictationState)
-            return
-        }
-
         cancel()
 
         isProcessing = true
         currentTask = Task {
             defer { isProcessing = false }
             do {
+                // 读文本放在 Task 里：整框读取要等宿主把光标挪动后的内容递上来
+                // （见 TextDocumentProxyReader.settleMilliseconds），不能同步阻塞点按。
+                guard let target = try await readTranslateTarget(from: proxy, dictationState: dictationState) else { return }
+
+                guard target.text.count >= 2 else {
+                    HapticManager.error()
+                    dictationState.textProcessingPhase = .error("内容太短，没什么可翻的")
+                    autoDismissError(dictationState: dictationState)
+                    return
+                }
+
                 // 桥模式：点之前先拉一次配置快照（主 App 在就刷新轮换后的 Key，
                 // 不在就瞬间失败、继续用旧缓存；拉取从不删旧缓存，见
                 // AppGroupCoordinator.pullBridgeConfigIntoCache）。
@@ -182,7 +186,7 @@ final class KeyboardTextProcessor {
                 }
 
                 dictationState.textProcessingPhase = .waitingForResult(
-                    modeName: SharedAIConfig.snapshot()?.model ?? "翻译"
+                    modeName: sourceLabel(for: target)
                 )
 
                 guard let translated = await SentenceTranslator.shared.translate(target.text) else {
@@ -214,24 +218,34 @@ final class KeyboardTextProcessor {
     private func readTranslateTarget(
         from proxy: UITextDocumentProxy,
         dictationState: KeyboardDictationState
-    ) -> Target? {
+    ) async throws -> Target? {
         // 框选优先：用户框了哪段就翻哪段，不动框外。
         if let selected = proxy.selectedText,
            !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             logger.logInfo("📝 [TextProcessor] Translating selection (\(selected.count) chars)")
-            return Target(text: selected, isSelection: true)
+            return Target(text: selected, isSelection: true, source: .selection)
         }
 
+        // 整框要挪光标、等宿主回内容，可能在点上之后还要等一会儿，先给个反馈。
+        dictationState.textProcessingPhase = .waitingForResult(modeName: "读取整段")
+
         // 整框：光标前全部文字（宿主默认只给紧贴光标的一段）。
-        switch TextDocumentProxyReader.readWholeTextBeforeCursor(from: proxy) {
+        switch await TextDocumentProxyReader.readWholeTextBeforeCursor(from: proxy) {
         case .whole(let whole):
             guard !whole.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return noTextError(dictationState: dictationState)
             }
             logger.logInfo("📝 [TextProcessor] Translating whole text before cursor (\(whole.count) chars)")
-            return Target(text: whole, isSelection: false)
-        case .unavailable:
-            break
+            return Target(text: whole, isSelection: false, source: .wholeDocument)
+        case .unavailable(let failure):
+            switch failure {
+            case .cancelled:
+                // 用户点了取消：光标已退回，什么都不做。
+                dictationState.textProcessingPhase = .idle
+                return nil
+            case .hostIgnoredCursorMove, .tooLong:
+                logger.logInfo("📝 [TextProcessor] Whole-text walk unavailable (\(failure.rawValue)) — falling back to the host's before-cursor chunk")
+            }
         case .cursorLost:
             // 光标被留在半路：这时不能回落（会按字数删错地方），直接放弃这一单。
             HapticManager.error()
@@ -242,21 +256,30 @@ final class KeyboardTextProcessor {
 
         // 回落：宿主不认光标移动，读到的“光标前一段”就是这次能拿到的全部。
         // readWholeTextBeforeCursor 已把光标退回原位，所以这里读到的仍是原来位置那一段。
-        logger.logInfo("📝 [TextProcessor] Whole-text walk unavailable — falling back to the host's before-cursor chunk")
         switch TextDocumentProxyReader.readText(from: proxy) {
         case .selectedText(let text):
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return noTextError(dictationState: dictationState)
             }
-            return Target(text: text, isSelection: true)
+            return Target(text: text, isSelection: true, source: .selection)
         case .textBeforeCursor(let text):
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return noTextError(dictationState: dictationState)
             }
             logger.logInfo("📝 [TextProcessor] Translating host chunk from before the cursor (\(text.count) chars)")
-            return Target(text: text, isSelection: false)
+            return Target(text: text, isSelection: false, source: .hostChunk)
         case .empty:
             return noTextError(dictationState: dictationState)
+        }
+    }
+
+    /// 「处理中」浮层上显示这次到底翻了多少字。整段读取可能被宿主挡回来，
+    /// 字数就是「只翻了一段」最直接的证据——用户不用连电脑看日志。
+    private func sourceLabel(for target: Target) -> String {
+        switch target.source {
+        case .selection: "选中 \(target.text.count) 字"
+        case .wholeDocument: "整段 \(target.text.count) 字"
+        case .hostChunk: "仅 \(target.text.count) 字·宿主没给整段"
         }
     }
 
@@ -378,6 +401,15 @@ final class KeyboardTextProcessor {
     private struct Target {
         let text: String
         let isSelection: Bool
+        /// 这段文字是从哪来的，只用来在「处理中」浮层上标字数。
+        var source: TargetSource = .hostChunk
+    }
+
+    /// 取到的文字从哪来：框选的、整框读到的、还是宿主只给了一段。
+    private enum TargetSource {
+        case selection
+        case wholeDocument
+        case hostChunk
     }
 
     /// Phase 1 - reads the text to rewrite, surfacing the empty case as an error.
