@@ -550,3 +550,10 @@ Watch 目录，产物只含主 App + 键盘（40MB），Sideloadly 免费 Apple 
 - 测试：`PersonalLexiconPromptBlockTests` 补 4 条（裸词渲染、词+对混排、
   空白错法视作纯识别、共用条目上限），`PersonalLexiconTests` 补 6 条
   （纯识别条目进提示词、绝不改字、进词表、去重、全局开关、中文分隔符）。
+- 单测（run 42814221243，Xcode 26.3 / iPhone 17 Pro 模拟器）：App target
+  226 项 18 套全过（含本轮新增 10 条），TextProcessing target 39 项全过
+  （含新增 4 条）。另有 4 处**与本次无关的上游遗留红**：`CustomOpenAIServiceTests`
+  两条断言还在比对英文文案（fork4 汉化后实际是「认证失败。请检查你的 API Key。」
+  /「接口 URL 格式无效」）、`MultiNoteChatViewModelTests` 与
+  `SmartSearchChatViewModelTests` 各一条（同样是「没有选择 AI 服务商」对英文）、
+  `DefaultKeychainServiceTests`（模拟器无钥匙串权限）。本次不改这四类。
