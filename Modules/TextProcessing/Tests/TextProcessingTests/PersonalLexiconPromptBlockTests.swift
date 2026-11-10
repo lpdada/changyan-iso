@@ -93,4 +93,50 @@ struct PersonalLexiconPromptBlockTests {
         #expect(block.contains("word0 => term0"))
         #expect(block.count < PersonalLexicon.promptCharacterBudget + 400)
     }
+
+    // MARK: - Recognition-only terms (正确写法 without 常见错法)
+
+    @Test func promptBlock_recognitionOnlyTermIsListedAsABareWord() {
+        let block = PersonalLexicon.promptBlock(terms: [
+            LexiconTerm(term: "muse")
+        ])
+
+        #expect(block.contains("muse"))
+        #expect(!block.contains("=>"))
+        #expect(block.contains(PersonalLexicon.recognitionOnlyInstruction))
+    }
+
+    @Test func promptBlock_mixesWordsAndPairs() {
+        let block = PersonalLexicon.promptBlock(terms: [
+            LexiconTerm(term: "muse"),
+            LexiconTerm(term: "muse get"),
+            LexiconTerm(original: "缪斯", replacement: "muse")
+        ])
+
+        #expect(block.contains(PersonalLexicon.recognitionOnlyInstruction))
+        #expect(block.contains(PersonalLexicon.pairInstruction))
+        #expect(block.contains("缪斯 => muse"))
+        // The bare words sit above the pairs, each on its own line.
+        #expect(block.split(separator: "\n").contains("muse"))
+        #expect(block.split(separator: "\n").contains("muse get"))
+    }
+
+    @Test func promptBlock_blankOriginalIsRecognitionOnly() {
+        let block = PersonalLexicon.promptBlock(terms: [
+            LexiconTerm(original: "   ", replacement: "muse")
+        ])
+
+        #expect(block.contains("muse"))
+        #expect(!block.contains("=>"))
+    }
+
+    @Test func promptBlock_recognitionOnlyTermsShareTheCap() {
+        let terms = (0..<10).map { LexiconTerm(term: "word\($0)") }
+
+        let block = PersonalLexicon.promptBlock(terms: terms, maxTerms: 2)
+
+        #expect(block.contains("word0"))
+        #expect(block.contains("word1"))
+        #expect(!block.contains("word2"))
+    }
 }

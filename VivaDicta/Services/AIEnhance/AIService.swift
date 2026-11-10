@@ -1499,10 +1499,11 @@ class AIService {
     /// custom vocabulary (terms the recognizer is biased toward), the user's
     /// personal lexicon, clipboard context, and the Chinese script hint.
     ///
-    /// The lexicon block tells the model which spellings the user prefers
-    /// (Settings → 词语替换, e.g. "缪斯 → muse"), so it preserves them instead of
-    /// "correcting" them away. It is empty - and the prompt therefore unchanged -
-    /// when the feature is off or no entry is enabled.
+    /// The lexicon block tells the model which words and spellings the user
+    /// prefers (Settings → 词库: a bare word such as "muse", and/or a
+    /// "缪斯 → muse" pair), so it prefers them instead of "correcting" them
+    /// away. It is empty - and the prompt therefore unchanged - when the
+    /// feature is off or no entry is enabled.
     ///
     /// Internal rather than private so tests can assert the composition without
     /// a provider round trip.

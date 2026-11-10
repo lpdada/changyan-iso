@@ -9,11 +9,18 @@ import SwiftUI
 import AppGroup
 import SwiftData
 
+/// Settings → 词库.
+///
+/// One entry = one word the user wants, optionally plus the forms the pipeline
+/// used to produce instead (常见错法). The wanted word alone is enough: adding
+/// `muse` and leaving 常见错法 blank makes every recognition layer prefer `muse`
+/// without installing a rigid find-and-replace rule - the same behaviour the
+/// desktop app has. Filling 常见错法 adds the deterministic rewrite on top.
 struct ReplacementsView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \WordReplacement.dateAdded, order: .reverse) private var replacements: [WordReplacement]
-    @State private var originalText: String = ""
-    @State private var replacementText: String = ""
+    @State private var preferredText: String = ""
+    @State private var misrecognitionText: String = ""
     @State private var replacementToEdit: WordReplacement?
 
     @State private var editMode = false
@@ -59,40 +66,40 @@ struct ReplacementsView: View {
                 }
             }
         }
-        .navigationTitle("词语替换")
+        .navigationTitle("个人词库")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(item: $replacementToEdit) { item in
             EditReplacementSheet(
-                originalText: item.originalText,
-                replacementText: item.replacementText
-            ) { newOriginal, newReplacement in
-                var trimmedOriginal = newOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
-                var trimmedReplacement = newReplacement.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmedOriginal.count > ReplacementsService.maxTextLength {
-                    trimmedOriginal = String(trimmedOriginal.prefix(ReplacementsService.maxTextLength))
+                preferredText: item.replacementText,
+                misrecognitionText: item.originalText
+            ) { newPreferred, newMisrecognitions in
+                var trimmedPreferred = newPreferred.trimmingCharacters(in: .whitespacesAndNewlines)
+                var trimmedMisrecognitions = newMisrecognitions.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmedPreferred.count > ReplacementsService.maxTextLength {
+                    trimmedPreferred = String(trimmedPreferred.prefix(ReplacementsService.maxTextLength))
                 }
-                if trimmedReplacement.count > ReplacementsService.maxTextLength {
-                    trimmedReplacement = String(trimmedReplacement.prefix(ReplacementsService.maxTextLength))
+                if trimmedMisrecognitions.count > ReplacementsService.maxTextLength {
+                    trimmedMisrecognitions = String(trimmedMisrecognitions.prefix(ReplacementsService.maxTextLength))
                 }
-                guard !trimmedOriginal.isEmpty, !trimmedReplacement.isEmpty else { return }
-                item.originalText = trimmedOriginal
-                item.replacementText = trimmedReplacement
+                guard !trimmedPreferred.isEmpty else { return }
+                item.replacementText = trimmedPreferred
+                item.originalText = trimmedMisrecognitions
                 replacementToEdit = nil
             }
             .presentationDetents(.sizeToFit)
         }
-        .alert("删除替换规则", isPresented: $showDeleteAlert) {
+        .alert("从词库删除", isPresented: $showDeleteAlert) {
             Button("删除", role: .destructive) {
                 deleteSelectedReplacements()
             }
             Button("取消", role: .cancel) { }
         } message: {
-            Text("确定要删除这 \(selectedReplacements.count) 条替换规则吗？此操作无法撤销。")
+            Text("确定要删除这 \(selectedReplacements.count) 个词吗？此操作无法撤销。")
         }
     }
 
     private var enableToggle: some View {
-        Toggle("启用替换规则", isOn: $isReplacementsEnabled)
+        Toggle("启用词库", isOn: $isReplacementsEnabled)
             .padding(.horizontal)
             .padding(.vertical, 8)
             .onChange(of: isReplacementsEnabled) { _, _ in
@@ -102,14 +109,14 @@ struct ReplacementsView: View {
 
     private var emptyStateView: some View {
         ContentUnavailableView {
-            Label("没有替换规则", systemImage: "arrow.left.arrow.right")
+            Label("词库是空的", systemImage: "text.book.closed")
         } description: {
             VStack(alignment: .leading, spacing: 8) {
-                Text("添加在转写时应用的文本替换规则")
+                Text("只写正确写法就能加词：听到像是这个词的语音，就会优先识别成它。")
                 Text("""
-                    For example:
-                        "My website link" -> "https://vivadicta.com"
-                        "Vivo dicte" -> "Changyan"
+                    常见错法可以不填，例如：
+                        muse
+                        缪斯 → muse
                     """)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -121,7 +128,7 @@ struct ReplacementsView: View {
 
     private var editModeToolbar: some View {
         HStack {
-            Button(allReplacementsSelected ? "Deselect All" : "Select All") {
+            Button(allReplacementsSelected ? "取消全选" : "全选") {
                 if allReplacementsSelected {
                     HapticManager.selectionChanged()
                     selectedReplacements.removeAll()
@@ -167,15 +174,22 @@ struct ReplacementsView: View {
                         }
 
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(replacement.originalText)
+                            Text(replacement.preferredSpelling)
                                 .font(.body)
-                            HStack(spacing: 4) {
-                                Image(systemName: "arrow.right")
+
+                            if replacement.isRecognitionOnly {
+                                Label("只优先识别", systemImage: "ear")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                                Text(replacement.replacementText)
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                            } else {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.left.arrow.right")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(replacement.misrecognitions.joined(separator: "、"))
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                         Spacer()
@@ -227,9 +241,9 @@ struct ReplacementsView: View {
     }
 
     private var addReplacementBar: some View {
-        VStack(spacing: 8) {
-            VStack(spacing: 4) {
-                TextField("原始文本", text: $originalText)
+        VStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("正确写法", text: $preferredText)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                     .padding(8)
@@ -237,51 +251,44 @@ struct ReplacementsView: View {
                         Capsule()
                             .stroke(.gray, lineWidth: 0.5)
                     }
-                    .onChange(of: originalText) { _, newValue in
+                    .onChange(of: preferredText) { _, newValue in
                         if newValue.count > ReplacementsService.maxTextLength {
-                            originalText = String(newValue.prefix(ReplacementsService.maxTextLength))
+                            preferredText = String(newValue.prefix(ReplacementsService.maxTextLength))
                         }
-                    }
-
-                if originalText.count > 0 {
-                    HStack {
-                        Spacer()
-                        Text("\(originalText.count)/\(ReplacementsService.maxTextLength)")
-                            .font(.caption)
-                            .foregroundStyle(originalText.count >= ReplacementsService.maxTextLength ? .orange : .secondary)
-                    }
-                }
-            }
-
-            VStack(spacing: 4) {
-                TextField("替换为", text: $replacementText)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .padding(8)
-                    .background {
-                        Capsule()
-                            .stroke(.gray, lineWidth: 0.5)
                     }
                     .onSubmit {
                         addReplacement()
                     }
-                    .onChange(of: replacementText) { _, newValue in
-                        if newValue.count > ReplacementsService.maxTextLength {
-                            replacementText = String(newValue.prefix(ReplacementsService.maxTextLength))
-                        }
-                    }
 
-                if replacementText.count > 0 {
-                    HStack {
-                        Spacer()
-                        Text("\(replacementText.count)/\(ReplacementsService.maxTextLength)")
-                            .font(.caption)
-                            .foregroundStyle(replacementText.count >= ReplacementsService.maxTextLength ? .orange : .secondary)
-                    }
-                }
+                Text("想说成这样，就写这个，比如 muse。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
-            Button("添加替换规则", action: addReplacement)
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("常见错法（可不填）", text: $misrecognitionText)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .padding(8)
+                    .background {
+                        Capsule()
+                            .stroke(.gray, lineWidth: 0.5)
+                    }
+                    .onChange(of: misrecognitionText) { _, newValue in
+                        if newValue.count > ReplacementsService.maxTextLength {
+                            misrecognitionText = String(newValue.prefix(ReplacementsService.maxTextLength))
+                        }
+                    }
+                    .onSubmit {
+                        addReplacement()
+                    }
+
+                Text("以前被识别成的写法，用顿号或逗号隔开，比如 缪斯、缪斯get。不填就只做优先识别。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button("添加到词库", action: addReplacement)
                 .buttonStyle(.borderedProminent)
                 .disabled(!canAddReplacement)
         }
@@ -290,116 +297,115 @@ struct ReplacementsView: View {
     }
 
     private var canAddReplacement: Bool {
-        !originalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !replacementText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !preferredText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func addReplacement() {
-        var trimmedOriginal = originalText.trimmingCharacters(in: .whitespacesAndNewlines)
-        var trimmedReplacement = replacementText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmedPreferred = preferredText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmedMisrecognitions = misrecognitionText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard !trimmedOriginal.isEmpty, !trimmedReplacement.isEmpty else { return }
+        // Only 正确写法 is required - an entry without 常见错法 is the normal case.
+        guard !trimmedPreferred.isEmpty else { return }
 
-        if trimmedOriginal.count > ReplacementsService.maxTextLength {
-            trimmedOriginal = String(trimmedOriginal.prefix(ReplacementsService.maxTextLength))
+        if trimmedPreferred.count > ReplacementsService.maxTextLength {
+            trimmedPreferred = String(trimmedPreferred.prefix(ReplacementsService.maxTextLength))
         }
-        if trimmedReplacement.count > ReplacementsService.maxTextLength {
-            trimmedReplacement = String(trimmedReplacement.prefix(ReplacementsService.maxTextLength))
+        if trimmedMisrecognitions.count > ReplacementsService.maxTextLength {
+            trimmedMisrecognitions = String(trimmedMisrecognitions.prefix(ReplacementsService.maxTextLength))
         }
 
-        // Check for duplicate original (case-insensitive)
+        // Check for duplicate word (case-insensitive)
         let isDuplicate = replacements.contains {
-            $0.originalText.lowercased() == trimmedOriginal.lowercased()
+            $0.preferredSpelling.lowercased() == trimmedPreferred.lowercased()
         }
         guard !isDuplicate else { return }
 
         HapticManager.mediumImpact()
         let wordReplacement = WordReplacement(
-            originalText: trimmedOriginal,
-            replacementText: trimmedReplacement
+            originalText: trimmedMisrecognitions,
+            replacementText: trimmedPreferred
         )
         modelContext.insert(wordReplacement)
-        originalText = ""
-        replacementText = ""
+        preferredText = ""
+        misrecognitionText = ""
     }
 }
 
-// MARK: - Edit Replacement Sheet
+// MARK: - Edit Lexicon Sheet
 
 private struct EditReplacementSheet: View {
-    let originalText: String
-    let replacementText: String
+    let preferredText: String
+    let misrecognitionText: String
     let onSave: (String, String) -> Void
 
-    @State private var editedOriginal: String
-    @State private var editedReplacement: String
+    @State private var editedPreferred: String
+    @State private var editedMisrecognitions: String
     @FocusState private var focusedField: Field?
 
     enum Field {
-        case original, replacement
+        case preferred, misrecognition
     }
 
-    init(originalText: String, replacementText: String, onSave: @escaping (String, String) -> Void) {
-        self.originalText = originalText
-        self.replacementText = replacementText
+    init(preferredText: String, misrecognitionText: String, onSave: @escaping (String, String) -> Void) {
+        self.preferredText = preferredText
+        self.misrecognitionText = misrecognitionText
         self.onSave = onSave
-        self._editedOriginal = State(initialValue: originalText)
-        self._editedReplacement = State(initialValue: replacementText)
+        self._editedPreferred = State(initialValue: preferredText)
+        self._editedMisrecognitions = State(initialValue: misrecognitionText)
     }
 
     private var hasChanges: Bool {
-        let trimmedOriginal = editedOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedReplacement = editedReplacement.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !trimmedOriginal.isEmpty &&
-               !trimmedReplacement.isEmpty &&
-               (trimmedOriginal != originalText || trimmedReplacement != replacementText)
+        let trimmedPreferred = editedPreferred.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedMisrecognitions = editedMisrecognitions.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmedPreferred.isEmpty &&
+               (trimmedPreferred != preferredText || trimmedMisrecognitions != misrecognitionText)
     }
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("编辑替换规则")
+            Text("编辑词条")
                 .font(.headline)
 
-            VStack(alignment: .trailing, spacing: 4) {
-                TextField("原始文本", text: $editedOriginal)
-                    .focused($focusedField, equals: .original)
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("正确写法", text: $editedPreferred)
+                    .focused($focusedField, equals: .preferred)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                     .padding(12)
                     .background(Color(.systemGray5), in: .rect(cornerRadius: 10))
-                    .onChange(of: editedOriginal) { _, newValue in
+                    .onChange(of: editedPreferred) { _, newValue in
                         if newValue.count > ReplacementsService.maxTextLength {
-                            editedOriginal = String(newValue.prefix(ReplacementsService.maxTextLength))
+                            editedPreferred = String(newValue.prefix(ReplacementsService.maxTextLength))
                         }
                     }
 
-                Text("\(editedOriginal.count)/\(ReplacementsService.maxTextLength)")
-                    .font(.caption)
-                    .foregroundStyle(editedOriginal.count >= ReplacementsService.maxTextLength ? .orange : .secondary)
+                Text("想说成这样，就写这个。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
-            VStack(alignment: .trailing, spacing: 4) {
-                TextField("替换为", text: $editedReplacement)
-                    .focused($focusedField, equals: .replacement)
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("常见错法（可不填）", text: $editedMisrecognitions)
+                    .focused($focusedField, equals: .misrecognition)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                     .padding(12)
                     .background(Color(.systemGray5))
                     .clipShape(.rect(cornerRadius: 10))
-                    .onChange(of: editedReplacement) { _, newValue in
+                    .onChange(of: editedMisrecognitions) { _, newValue in
                         if newValue.count > ReplacementsService.maxTextLength {
-                            editedReplacement = String(newValue.prefix(ReplacementsService.maxTextLength))
+                            editedMisrecognitions = String(newValue.prefix(ReplacementsService.maxTextLength))
                         }
                     }
 
-                Text("\(editedReplacement.count)/\(ReplacementsService.maxTextLength)")
-                    .font(.caption)
-                    .foregroundStyle(editedReplacement.count >= ReplacementsService.maxTextLength ? .orange : .secondary)
+                Text("以前被识别成的写法，顿号或逗号隔开；不填就只做优先识别。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             Button("保存修改") {
                 HapticManager.mediumImpact()
-                onSave(editedOriginal, editedReplacement)
+                onSave(editedPreferred, editedMisrecognitions)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 14)
@@ -411,7 +417,7 @@ private struct EditReplacementSheet: View {
         .padding()
         .presentationDragIndicator(.hidden)
         .onAppear {
-            focusedField = .original
+            focusedField = .preferred
         }
     }
 }

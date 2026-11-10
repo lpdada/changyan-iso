@@ -9,6 +9,13 @@ import Foundation
 import AppGroup
 import SwiftData
 
+/// The words the transcribers are biased toward.
+///
+/// Two sources feed it: the 词典 list (`VocabularyWord`, Settings → 拼写纠正) and
+/// the 正确写法 of every 词库 entry (Settings → 词库). The second source is what
+/// lets the user add a word *without* writing a replacement rule - the word
+/// still reaches the local booster, the cloud providers' term lists and the AI
+/// prompt.
 enum CustomVocabulary {
     /// Set once at app startup to enable SwiftData-backed vocabulary lookups
     static var modelContainer: ModelContainer?
@@ -26,11 +33,15 @@ enum CustomVocabulary {
         let context = ModelContext(container)
         let descriptor = FetchDescriptor<VocabularyWord>(sortBy: [SortDescriptor(\VocabularyWord.word)])
 
-        guard let items = try? context.fetch(descriptor), !items.isEmpty else {
-            return []
-        }
+        let items = (try? context.fetch(descriptor)) ?? []
 
-        let words = items.map { $0.word.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        var words = items.map { $0.word.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+
+        // 词库 entries contribute their 正确写法 whether or not they also name a
+        // 常见错法: recognition-only entries are the whole point of that screen.
+        words.append(contentsOf: ReplacementsService.preferredWords(context: context))
+
+        guard !words.isEmpty else { return [] }
 
         // De-duplicate while preserving order
         var seen = Set<String>()

@@ -473,6 +473,11 @@ Watch 目录，产物只含主 App + 键盘（40MB），Sideloadly 免费 Apple 
 - 首版 CI 编译失败（BatchSummarySheet 里 @State error 与 catch 隐式
   error 同名遮蔽），改名 errorMessage 后重打。
 
+## fork28（2026-11-10）：个人词库端到端生效（进提示词 + 兜底替换）
+
+- 设置 → 词语替换的规则同时当作个人词库：条目渲染进
+  `<PERSONAL_LEXICON>` 提示词块，让模型照用户写法写；润色完再跑一次
+  替换兜底，键盘收到的结果也过同一层，AI 不会把 `muse` 改回「缪斯」。
 - 测试：新增 `VivaDictaTests/PersonalLexiconTests.swift`、
   `Modules/TextProcessing/Tests/TextProcessingTests/PersonalLexiconPromptBlockTests.swift`，
   并在 `RecordViewModelTests` 补三条（润色后仍替换、语音指令结果替换、空词库不动）。
@@ -521,3 +526,27 @@ Watch 目录，产物只含主 App + 键盘（40MB），Sideloadly 免费 Apple 
   `TranscriptionManager.swift` 两边改动在不同位置，自动合并无冲突。
 - 词库与流式互不干扰：词库是转写后处理（替换 + 润色提示词），
   流式是转写本身（实时会话）；流式回落上传时同样走词库的替换层。
+
+## fork31（2026-11-10）：词库改成「只填正确写法」也能用
+
+- 用户反馈（对照电脑版）：词库不该是一条必须配齐「原始文本 → 替换文本」
+  的替换规则；它就是**加常用词**的地方。只写 `muse`、常见错法留空，
+  以后听到差不多像的语音就该优先识别成 `muse`。
+- 语义重排（数据不变，老条目自动兼容）：
+  - `WordReplacement.replacementText` 就是**正确写法**（必填），
+    `originalText` 变成可选的**常见错法**列表（逗号、顿号、分号、斜杠都认）。
+  - 只填正确写法 = 纯识别条目：进转写词表（`CustomVocabulary.getTerms`
+    合并 `ReplacementsService.preferredWords`，本机 Parakeet 加权、
+    云厂商词表、AI 提示词全吃到）+ `<PERSONAL_LEXICON>` 的「speaker 的词」
+    段，**不参与任何正则替换**。
+  - 填了常见错法 = 在识别之外再加确定性替换（转写后一次、润色后一次，
+    键盘回传的结果同样过）。
+- 提示词块拆两段：一段列光秃秃的词（"audio merely sounds like → 就这么写"），
+  一段列 `错法 => 正确写法`；两段共用原有 maxTerms / 字符预算，词库为空时
+  提示词仍逐字节不变。
+- 界面：设置 → 词库（原「词语替换」）。输入区两个框：正确写法（必填）、
+  常见错法（可不填，占位文案写明「不填就只做优先识别」）；列表行只显示
+  正确写法，纯识别条目挂一个「只优先识别」标签；编辑页同样允许清空常见错法。
+- 测试：`PersonalLexiconPromptBlockTests` 补 4 条（裸词渲染、词+对混排、
+  空白错法视作纯识别、共用条目上限），`PersonalLexiconTests` 补 6 条
+  （纯识别条目进提示词、绝不改字、进词表、去重、全局开关、中文分隔符）。

@@ -189,7 +189,7 @@ struct SettingsView: View {
                     }
 
                     NavigationLink(value: SettingsDestination.replacements) {
-                        Text("词语替换")
+                        Text("词库")
                     }
                 }
                 

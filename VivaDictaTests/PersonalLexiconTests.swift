@@ -5,10 +5,11 @@ import SwiftData
 import Testing
 @testable import VivaDicta
 
-/// The personal lexicon end to end, minus the network: "词语替换" entries must
+/// The personal lexicon end to end, minus the network: "词库" entries must
 /// reach the AI enhance prompt, must still be applied to the AI output, and must
 /// change nothing when the lexicon is empty, fully disabled, or switched off
-/// globally.
+/// globally. An entry that carries only the 正确写法 (no 常见错法) must bias
+/// recognition without ever rewriting text.
 ///
 /// The app-level half of the coverage - the pure renderer is covered by
 /// `TextProcessingTests/PersonalLexiconPromptBlockTests`.
@@ -168,5 +169,66 @@ struct PersonalLexiconTests {
 
         #expect(ReplacementsService.applyReplacementsIfEnabled(to: "缪斯", context: context, isEnabled: true) == "muse")
         #expect(ReplacementsService.applyReplacementsIfEnabled(to: "缪斯", context: context, isEnabled: false) == "缪斯")
+    }
+
+    // MARK: - Recognition-only entries (正确写法 without 常见错法)
+
+    @Test func recognitionOnlyEntry_reachesThePromptAsABareWord() throws {
+        let context = try makeContext()
+        try insert("", "muse", into: context)
+
+        let block = ReplacementsService.lexiconPromptBlock(context: context, isEnabled: true)
+
+        #expect(block.contains("<PERSONAL_LEXICON>"))
+        #expect(block.contains("muse"))
+        // No 常见错法 means no pair rendering at all.
+        #expect(!block.contains("=>"))
+    }
+
+    @Test func recognitionOnlyEntry_neverRewritesText() throws {
+        let context = try makeContext()
+        try insert("", "muse", into: context)
+
+        let text = "今天聊了缪斯和他的专辑。"
+        let final = ReplacementsService.applyReplacementsIfEnabled(to: text, context: context, isEnabled: true)
+
+        #expect(final == text)
+    }
+
+    @Test func recognitionOnlyEntry_joinsTheVocabularyTerms() throws {
+        let context = try makeContext()
+        try insert("缪斯", "muse", into: context)
+        try insert("", "muse get", into: context)
+
+        let words = ReplacementsService.preferredWords(context: context, isEnabled: true)
+
+        #expect(words == ["muse", "muse get"])
+    }
+
+    @Test func preferredWords_areDeduplicated() throws {
+        let context = try makeContext()
+        try insert("缪斯", "muse", into: context)
+        try insert("", "Muse", into: context)
+
+        #expect(ReplacementsService.preferredWords(context: context, isEnabled: true) == ["muse"])
+    }
+
+    @Test func preferredWords_respectTheGlobalSwitch() throws {
+        let context = try makeContext()
+        try insert("", "muse", into: context)
+
+        #expect(ReplacementsService.preferredWords(context: context, isEnabled: true) == ["muse"])
+        #expect(ReplacementsService.preferredWords(context: context, isEnabled: false).isEmpty)
+    }
+
+    @Test func misrecognitions_acceptChineseAndFullWidthSeparators() throws {
+        let context = try makeContext()
+        try insert("缪斯、缪丝，谬斯", "muse", into: context)
+
+        let block = ReplacementsService.lexiconPromptBlock(context: context, isEnabled: true)
+
+        #expect(block.contains("缪斯 => muse"))
+        #expect(block.contains("缪丝 => muse"))
+        #expect(block.contains("谬斯 => muse"))
     }
 }

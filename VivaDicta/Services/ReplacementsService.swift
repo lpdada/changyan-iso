@@ -12,19 +12,24 @@ import AppGroup
 import TextProcessing
 import os
 
-/// Provides word replacement functionality backed by SwiftData.
-/// The static `applyReplacements(to:)` method is used in the transcription pipeline.
-/// CRUD operations happen directly via `ModelContext` in views.
+/// The user's personal lexicon (Settings → 词库), backed by SwiftData.
 ///
-/// The same rules are also the user's personal lexicon (Settings → 词语替换):
-/// besides the pass inside the transcription pipeline
-/// (`TranscriptionManager.postProcess`), they feed the AI enhance prompt
-/// (`lexiconPromptBlock`) and are applied again to the AI output
-/// (`applyReplacementsIfEnabled`) - see ``RecordViewModel/applyPersonalLexicon``.
-/// Between the two layers a preferred spelling such as "缪斯 → muse" sticks no
-/// matter what the model does with it.
+/// An entry is a **word the user wants** (`replacementText` / 正确写法) plus an
+/// optional list of the forms the pipeline used to produce instead
+/// (`originalText` / 常见错法). Two layers come out of that:
+///
+/// - **Recognition**: every entry's 正确写法 is offered to the transcribers and
+///   to the AI enhance prompt as a word the speaker uses (``preferredWords``,
+///   ``lexiconPromptBlock``). An entry without 常见错法 stops here - it nudges
+///   the recognizer toward the word and rewrites nothing.
+/// - **Replacement**: an entry *with* 常见错法 additionally rewrites those forms
+///   to 正确写法, once inside the transcription pipeline
+///   (`TranscriptionManager.postProcess`) and once more on the AI output
+///   (`applyReplacementsIfEnabled`, see ``RecordViewModel/applyPersonalLexicon``).
+///   Between the two layers a preferred spelling such as "缪斯 → muse" sticks no
+///   matter what the model does with it.
 enum ReplacementsService {
-    /// Maximum character length for original or replacement text
+    /// Maximum character length for the preferred spelling or the 常见错法 list
     static let maxTextLength = 100
 
     /// Set once at app startup to enable SwiftData-backed replacement lookups
@@ -32,8 +37,8 @@ enum ReplacementsService {
 
     // MARK: - Global Toggle
 
-    /// Whether the user's replacement rules participate at all - the global
-    /// "启用替换规则" switch in Settings. Both layers respect it, so turning it
+    /// Whether the user's lexicon participates at all - the global
+    /// "启用词库" switch in Settings. Every layer respects it, so turning it
     /// off leaves the final text and the enhance prompt exactly as they were.
     static var isGloballyEnabled: Bool {
         UserDefaultsStorage.appPrivate.object(forKey: UserDefaultsStorage.Keys.isReplacementsEnabled) as? Bool ?? true
@@ -41,11 +46,14 @@ enum ReplacementsService {
 
     // MARK: - Apply Replacements
 
-    /// Applies all enabled replacements from SwiftData to the given text.
+    /// Applies the 常见错法 → 正确写法 rules of all enabled entries to the text.
+    ///
+    /// Recognition-only entries have no 常见错法, so they contribute nothing
+    /// here by construction - adding a word to the lexicon never rewrites text.
     ///
     /// - Parameters:
     ///   - text: Text to rewrite.
-    ///   - context: SwiftData context to read the rules from. `nil` uses the
+    ///   - context: SwiftData context to read the entries from. `nil` uses the
     ///     app-wide container set at launch; callers that already own a context
     ///     (background work, tests) can pass theirs.
     static func applyReplacements(to text: String, context: ModelContext? = nil) -> String {
@@ -58,19 +66,20 @@ enum ReplacementsService {
         var modifiedText = text
 
         for replacement in replacements {
-            let replacementText = replacement.replacementText
+            let preferred = replacement.preferredSpelling
+            guard !preferred.isEmpty else { continue }
 
-            for original in variants(of: replacement.originalText) {
+            for original in replacement.misrecognitions {
                 let usesBoundaries = usesWordBoundaries(for: original)
 
                 if usesBoundaries {
                     let escapedOriginal = NSRegularExpression.escapedPattern(for: original)
                     if let regex = try? Regex("\\b\(escapedOriginal)\\b").ignoresCase() {
-                        modifiedText = modifiedText.replacing(regex, with: replacementText)
+                        modifiedText = modifiedText.replacing(regex, with: preferred)
                     }
                 } else {
                     if let regex = try? Regex(NSRegularExpression.escapedPattern(for: original)).ignoresCase() {
-                        modifiedText = modifiedText.replacing(regex, with: replacementText)
+                        modifiedText = modifiedText.replacing(regex, with: preferred)
                     }
                 }
             }
@@ -79,8 +88,8 @@ enum ReplacementsService {
         return modifiedText
     }
 
-    /// Applies the replacements to text the AI produced, unless the user turned
-    /// the feature off entirely.
+    /// Applies the replacement rules to text the AI produced, unless the user
+    /// turned the feature off entirely.
     ///
     /// This is the final layer: the transcription pipeline runs the
     /// replacements *before* enhancement, so a model that "corrects" a
@@ -90,7 +99,7 @@ enum ReplacementsService {
     ///
     /// - Parameters:
     ///   - text: Text to rewrite.
-    ///   - context: SwiftData context to read the rules from; `nil` uses the
+    ///   - context: SwiftData context to read the entries from; `nil` uses the
     ///     app-wide container.
     ///   - isEnabled: The global switch. `nil` (the default) reads the stored
     ///     preference; an explicit value is honored as-is, which is what tests
@@ -104,33 +113,73 @@ enum ReplacementsService {
         return applyReplacements(to: text, context: context)
     }
 
-    // MARK: - Lexicon Prompt Block
+    // MARK: - Recognition Layer
 
-    /// The enabled rules as lexicon terms, one term per comma-separated
-    /// original (same split the replacement pass uses).
+    /// The enabled entries as lexicon terms: one term per comma-separated
+    /// 常见错法, or a single recognition-only term when the user left 常见错法
+    /// blank. Order follows `dateAdded` so both layers behave deterministically.
     static func enabledTerms(context: ModelContext? = nil) -> [LexiconTerm] {
-        enabledReplacements(context: context).flatMap { replacement in
-            variants(of: replacement.originalText).map { original in
-                LexiconTerm(
-                    original: original,
-                    replacement: replacement.replacementText,
-                    isEnabled: replacement.isEnabled
-                )
+        enabledReplacements(context: context).flatMap { replacement -> [LexiconTerm] in
+            let preferred = replacement.preferredSpelling
+            guard !preferred.isEmpty else { return [] }
+            guard replacement.isEnabled else { return [] }
+
+            let misrecognitions = replacement.misrecognitions
+            guard !misrecognitions.isEmpty else {
+                return [LexiconTerm(term: preferred, isEnabled: true)]
+            }
+            return misrecognitions.map { original in
+                LexiconTerm(original: original, replacement: preferred, isEnabled: true)
             }
         }
     }
 
+    /// The 正确写法 of every enabled entry, deduplicated - the words the
+    /// recognizers are biased toward and the AI prompt is told the speaker uses.
+    ///
+    /// This is what makes "I only added the word, no 常见错法" behave like the
+    /// desktop app: the entry reaches every recognition layer without becoming
+    /// a rigid find-and-replace rule.
+    ///
+    /// - Parameters:
+    ///   - context: SwiftData context to read the entries from; `nil` uses the
+    ///     app-wide container.
+    ///   - isEnabled: The global switch; `nil` reads the stored preference.
+    ///   - maxTerms: Optional cap on how many words are returned.
+    static func preferredWords(
+        context: ModelContext? = nil,
+        isEnabled: Bool? = nil,
+        maxTerms: Int? = nil
+    ) -> [String] {
+        guard isEnabled ?? isGloballyEnabled else { return [] }
+
+        var seen = Set<String>()
+        var words: [String] = []
+
+        for replacement in enabledReplacements(context: context) {
+            let word = replacement.preferredSpelling
+            guard !word.isEmpty else { continue }
+            guard seen.insert(word.lowercased()).inserted else { continue }
+
+            words.append(word)
+            if let maxTerms, words.count >= maxTerms { break }
+        }
+
+        return words
+    }
+
     /// The `<PERSONAL_LEXICON>` block appended to the AI enhance prompt so the
     /// model preserves the user's preferred spellings instead of "correcting"
-    /// them. Empty when the feature is off or nothing is enabled, which keeps
-    /// the prompt unchanged for everyone else.
+    /// them, and knows which words the speaker uses. Empty when the feature is
+    /// off or nothing is enabled, which keeps the prompt unchanged for everyone
+    /// else.
     /// - Parameters:
-    ///   - context: SwiftData context to read the rules from; `nil` uses the
+    ///   - context: SwiftData context to read the entries from; `nil` uses the
     ///     app-wide container.
     ///   - isEnabled: The global switch. `nil` (the default) reads the stored
     ///     preference; an explicit value is honored as-is (tests use this).
-    ///   - maxTerms: Maximum number of pairs to list.
-    ///   - characterBudget: Maximum number of characters spent on listed pairs.
+    ///   - maxTerms: Maximum number of entries to list.
+    ///   - characterBudget: Maximum number of characters spent on listed entries.
     static func lexiconPromptBlock(
         context: ModelContext? = nil,
         isEnabled: Bool? = nil,
@@ -147,7 +196,7 @@ enum ReplacementsService {
 
     // MARK: - Fetching
 
-    /// Enabled rules in the order the user added them, so both layers behave
+    /// Enabled entries in the order the user added them, so both layers behave
     /// deterministically when two rules could match the same text.
     private static func enabledReplacements(context: ModelContext? = nil) -> [WordReplacement] {
         guard let context = context ?? makeContext() else { return [] }
@@ -163,14 +212,6 @@ enum ReplacementsService {
     private static func makeContext() -> ModelContext? {
         guard let container = modelContainer else { return nil }
         return ModelContext(container)
-    }
-
-    /// Splits comma-separated originals at apply time
-    private static func variants(of originalText: String) -> [String] {
-        originalText
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
     }
 
     // MARK: - Script Detection
