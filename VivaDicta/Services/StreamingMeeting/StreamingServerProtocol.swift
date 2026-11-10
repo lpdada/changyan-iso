@@ -85,7 +85,12 @@ enum StreamingServerEvent: Sendable {
 /// `type` this client does not consume also returns nil from `event(from:)`
 /// but is still a valid `Frame`, so an unknown type is silent rather than an
 /// error in the log.
-enum StreamingServerMessageParser {
+///
+/// Pure JSON decoding, no state and no actor affinity: `nonisolated` so the
+/// socket actor (`StreamingWebSocketClient`) and the dictation actor
+/// (`SelfHostedRealtimeSession`) can both call it. Without it Swift 6 infers
+/// MainActor isolation for this type and the two actors cannot use it.
+nonisolated enum StreamingServerMessageParser {
     /// One frame of the streaming contract. All names are the contract's
     /// names, not Swift-style renames; `speaker_label` is optional
     /// because interim frames carry null until a speaker is assigned.

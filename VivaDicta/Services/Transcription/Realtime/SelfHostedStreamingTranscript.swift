@@ -24,7 +24,11 @@ import Foundation
 /// Pure value type, Foundation-only: the session actor owns one, and the rules
 /// above are tested directly (on CI, and by the Linux harness) rather than
 /// inferred from a live transcript.
-struct SelfHostedStreamingTranscript: Sendable, Equatable {
+///
+/// `nonisolated` so the dictation actor (`SelfHostedRealtimeSession`) can read
+/// and mutate it. Without it Swift 6 infers MainActor isolation for this type
+/// and the actor cannot touch its own transcript.
+nonisolated struct SelfHostedStreamingTranscript: Sendable, Equatable {
     struct Segment: Sendable, Equatable {
         /// The server's `segment_id`. Identity for every update.
         let segmentID: String
