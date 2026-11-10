@@ -472,3 +472,34 @@ Watch 目录，产物只含主 App + 键盘（40MB），Sideloadly 免费 Apple 
   输入过长时截取前 10000 字并在输入中注明是截取的部分内容。
 - 首版 CI 编译失败（BatchSummarySheet 里 @State error 与 catch 隐式
   error 同名遮蔽），改名 errorMessage 后重打。
+
+## fork29（2026-11-10）：听写接自建流式服务（边说边转写）
+
+- 现象：听写要整段录完才开始转写，说完还要等；会议记录是流式，
+  边说边出字。本轮把听写也接到自建流式端点（会议那条
+  `wss://<host>/v1/stream`，Zipformer 中英双语 + 日语流式模型）。
+- 新模型「中英流式（自建）」：出现在转写模型目录末尾，默认不改，
+  用户自选才走流式。选的默认模型一个字不动。
+- 实现：新增 `SelfHostedRealtimeSession`（RealtimeDictationSession），
+  复用会议的 `StreamingWebSocketClient`；帧类型与解析从该客户端拆到
+  `StreamingServerProtocol.swift`，会议与听写共用同一份解析，会议侧
+  调用点零改动。`SelfHostedStreamingTranscript` 按服务器 `segment_id`
+  归并（interim 原地替换、final 覆盖、离线纠错终稿优先），中英边界
+  拼接（CJK 不加空格、拉丁单空格）。
+- 回落：没配 Key → 不走流式（文件老路）；socket 断、服务器 error 帧、
+  等不到 `session_end`、没有任何文本 → `finish()` 一律抛错，
+  RecordViewModel 已有的 catch 走上传，WAV 照常保存；上传侧模型名经
+  `asyncEquivalent` 换成 sensevoice（`/v1/transcribe` 不认识流式 slug）。
+  要翻译或说话人标签的模式仍走上传路径。语言不支持时服务器回
+  `streaming_unsupported_language`，同样回落。
+- 本轮不做边说边显示中间文字（`onPartialResult: nil` 保留）；收益是
+  停下时文字基本已就绪，只等 AI 润色。`finish()` 等 `session_end`
+  上限 10 秒，超时回落（慢，不存半截文本）；回落默认模型是 sensevoice。
+- 准确度：流式模型与文件老路不是同一个模型，不承诺流式更准；终稿
+  用服务器端纠错结果，真机需用自己的声音对照（中英混说）再决定
+  是否当默认。流式模型是中英双语，日语等其他语言会回落文件老路。
+- 测试：新增 `SelfHostedStreamingDictationTests.swift`（40 个 @Test，
+  解析 / 归并 / 拼接 / end-of-audio / 断开 / 超时 / 无文本 / 取消 /
+  语言 / 注册与回落），样例报文 + 假 socket，不碰 live 服务器。
+  peng 上用 swift:6.0 容器对 4 个生产文件实跑 55 项断言 0 失败，
+  11 个改动文件 swiftc -parse 全过；App target 与 CI 回归待拉回跑。

@@ -49,6 +49,13 @@ enum SelfHostedTranscriptionConfig {
     private static let apiKeyKey = "selfHostedTranscriptionAPIKey"
 
     static var apiKey: String? {
+        apiKey(using: keychain)
+    }
+
+    /// Same lookup against a caller-supplied keychain, so the realtime
+    /// coordinator's key routing can be tested without the real keychain (and
+    /// without touching the user's on the CI machine).
+    static func apiKey(using keychain: any KeychainService) -> String? {
         let key = keychain.getString(forKey: apiKeyKey)
         return key?.isEmpty == true ? nil : key
     }
