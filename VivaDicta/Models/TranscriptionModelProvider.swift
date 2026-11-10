@@ -166,6 +166,15 @@ enum TranscriptionModelProvider: String, Sendable, Codable, CaseIterable, Identi
     /// Gemini's dedicated batch STT model, used when a Live selection uploads.
     nonisolated static let geminiBatchTranscribeModel = "gemini-3.5-transcribe"
 
+    /// 自建服务器的流式模型。它不是 `/v1/transcribe` 认识的名字：流式走的是会议那条
+    /// `wss://<host>/v1/stream`（同一套 auth/final/end 帧），上传接口只认 sensevoice
+    /// 这些模型名，所以文件老路一律换成 `selfHostedBatchModel`。
+    nonisolated static let selfHostedRealtimeModel = "streaming-zh-en"
+
+    /// 自建服务器文件老路的默认模型：自建模型列表的第一项，也就是
+    /// `ModeEditViewModel.updateTranscriptionProvider` 切到自建服务器时自动选中的那个。
+    nonisolated static let selfHostedBatchModel = "sensevoice"
+
     nonisolated static func isDeepgramFluxModel(_ modelName: String) -> Bool {
         modelName == deepgramFluxEnglishModel || modelName == deepgramFluxMultilingualModel
     }
@@ -181,6 +190,7 @@ enum TranscriptionModelProvider: String, Sendable, Codable, CaseIterable, Identi
             || modelName == mistralRealtimeModel
             || modelName == cartesiaRealtimeModel
             || modelName == geminiLiveRealtimeModel
+            || modelName == selfHostedRealtimeModel
     }
 
     /// The model to send to a batch/upload endpoint for a given selection.
@@ -193,6 +203,10 @@ enum TranscriptionModelProvider: String, Sendable, Codable, CaseIterable, Identi
         if modelName == mistralRealtimeModel { return mistralBatchModel }
         if modelName == cartesiaRealtimeModel { return cartesiaBatchModel }
         if modelName == geminiLiveRealtimeModel { return geminiBatchTranscribeModel }
+        // The self-hosted socket slug is not a model the upload endpoint knows,
+        // so both the keyboard path and the dropped-socket fallback send the
+        // server's own default batch model instead.
+        if modelName == selfHostedRealtimeModel { return selfHostedBatchModel }
         return modelName == sonioxRealtimeModel ? sonioxAsyncModel : modelName
     }
     
@@ -908,6 +922,18 @@ enum TranscriptionModelProvider: String, Sendable, Codable, CaseIterable, Identi
                 provider: .selfHosted,
                 speed: 0.95,
                 accuracy: 0.9,
+                cost: 0.05,  // 自建服务器，无按量费用
+                supportManyLanguages: true,
+                supportedLanguages: allLanguages
+            ),
+
+            CloudModel(
+                name: "streaming-zh-en",
+                displayName: "中英流式（自建）",
+                description: "自建服务器的流式端点：边说边转写，停下时文字基本已就绪，只等 AI 润色。流式模型与文件老路不是同一个模型，准确度请用自己的声音实测对照（注：中英双语，日语等其他语言会回落到文件老路）",
+                provider: .selfHosted,
+                speed: 1.0,
+                accuracy: 0.85,  // 与自建默认模型同档：不把流式标成更准，准确度只靠真机实测
                 cost: 0.05,  // 自建服务器，无按量费用
                 supportManyLanguages: true,
                 supportedLanguages: allLanguages

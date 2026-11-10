@@ -473,29 +473,51 @@ Watch 目录，产物只含主 App + 键盘（40MB），Sideloadly 免费 Apple 
 - 首版 CI 编译失败（BatchSummarySheet 里 @State error 与 catch 隐式
   error 同名遮蔽），改名 errorMessage 后重打。
 
-## fork28（2026-11-10）：个人词库端到端生效（词语替换改完不再被 AI 改回去）
-
-- 现象：在 设置 → 词语替换 里加了「缪斯 → muse」，键盘语音输入出稿后仍可能是
-  「缪斯」。原因是替换在转写管线里跑，而 AI 润色排在它后面，模型会把
-  「缪斯」当成错字"顺手改回去"，改回去的文本才是最终被分享、被插入的文本。
-- 修法（两层，都认同一个总开关 `isReplacementsEnabled`）：
-  1. 提示词层：把**已启用**的词条按 `<PERSONAL_LEXICON>` 段追加进 AI 润色的
-     system message，要求模型保留用户要的写法。最多 50 条 / 600 字符，
-     去重，条目为空或全部禁用时这一段完全不出现（提示词与改动前逐字节一致）。
-  2. 兜底层：AI 输出之后再跑一次同一套替换，落在保存 / 分享给键盘 / 插入之前，
-     模型怎么改都改不掉。
-- 覆盖的插入路径：听写主流程（`transcribeSpeechTask`）、键盘文本处理
-  （`handleKeyboardTextProcessingRequest`，含预设改写）、语音指令
-  「说出来改」（`applyVoiceInstruction`）。
-- 文件：新增
-  `Modules/TextProcessing/Sources/TextProcessing/PersonalLexicon.swift`（纯渲染，
-  可单测）；改 `VivaDicta/Services/ReplacementsService.swift`（总开关、
-  `applyReplacementsIfEnabled`、`lexiconPromptBlock`、可注入 context、按
-  `dateAdded` 排序）、`VivaDicta/Services/AIEnhance/AIService.swift`
-  （`enhancePromptContextSections`）、`VivaDicta/Views/RecordViewModel.swift`
-  （`applyPersonalLexicon` 最后一层）、
-  `VivaDicta/Services/Transcription/TranscriptionManager.swift`（总开关收口）。
-- 存储与 UI 不动：还是 设置 → 词语替换，`WordReplacement` 模型形状不变，不新增设置页。
 - 测试：新增 `VivaDictaTests/PersonalLexiconTests.swift`、
   `Modules/TextProcessing/Tests/TextProcessingTests/PersonalLexiconPromptBlockTests.swift`，
   并在 `RecordViewModelTests` 补三条（润色后仍替换、语音指令结果替换、空词库不动）。
+
+## fork29（2026-11-10）：听写接自建流式服务（边说边转写）
+
+- 现象：听写要整段录完才开始转写，说完还要等；会议记录是流式，
+  边说边出字。本轮把听写也接到自建流式端点（会议那条
+  `wss://<host>/v1/stream`，Zipformer 中英双语 + 日语流式模型）。
+- 新模型「中英流式（自建）」：出现在转写模型目录末尾，默认不改，
+  用户自选才走流式。选的默认模型一个字不动。
+- 实现：新增 `SelfHostedRealtimeSession`（RealtimeDictationSession），
+  复用会议的 `StreamingWebSocketClient`；帧类型与解析从该客户端拆到
+  `StreamingServerProtocol.swift`，会议与听写共用同一份解析，会议侧
+  调用点零改动。`SelfHostedStreamingTranscript` 按服务器 `segment_id`
+  归并（interim 原地替换、final 覆盖、离线纠错终稿优先），中英边界
+  拼接（CJK 不加空格、拉丁单空格）。
+- 回落：没配 Key → 不走流式（文件老路）；socket 断、服务器 error 帧、
+  等不到 `session_end`、没有任何文本 → `finish()` 一律抛错，
+  RecordViewModel 已有的 catch 走上传，WAV 照常保存；上传侧模型名经
+  `asyncEquivalent` 换成 sensevoice（`/v1/transcribe` 不认识流式 slug）。
+  要翻译或说话人标签的模式仍走上传路径。语言不支持时服务器回
+  `streaming_unsupported_language`，同样回落。
+- 本轮不做边说边显示中间文字（`onPartialResult: nil` 保留）；收益是
+  停下时文字基本已就绪，只等 AI 润色。`finish()` 等 `session_end`
+  上限 10 秒，超时回落（慢，不存半截文本）；回落默认模型是 sensevoice。
+- 准确度：流式模型与文件老路不是同一个模型，不承诺流式更准；终稿
+  用服务器端纠错结果，真机需用自己的声音对照（中英混说）再决定
+  是否当默认。流式模型是中英双语，日语等其他语言会回落文件老路。
+- 测试：新增 `SelfHostedStreamingDictationTests.swift`（40 个 @Test，
+  解析 / 归并 / 拼接 / end-of-audio / 断开 / 超时 / 无文本 / 取消 /
+  语言 / 注册与回落），样例报文 + 假 socket，不碰 live 服务器。
+  peng 上用 swift:6.0 容器对 4 个生产文件实跑 55 项断言 0 失败，
+  11 个改动文件 swiftc -parse 全过；App target 与 CI 回归待拉回跑。
+- 首版 CI 编译失败（Swift 6 主执行器推断：`StreamingServerMessageParser`
+  与 `SelfHostedStreamingTranscript` 两个纯类型被推断为 MainActor 隔离，
+  会议 socket actor 与听写 actor 用不了，共 6 处编译错），两处加
+  `nonisolated` 后重打通过（纯类型，无执行器归属）。
+
+## fork30（2026-11-10）：词库 + 流式合并版（fork28 + fork29）
+
+- fork43（词库）与 fork44（流式）是两个独立分支，都基于 main；
+  本轮把两者合并到一个分支，词库与流式同时可用，默认都不改。
+- 合并冲突只有 FORK-NOTES.md（两边都在 fork27 后追加条目），
+  按 fork28 → fork29 顺序保留两条，另加本条 fork30。
+  `TranscriptionManager.swift` 两边改动在不同位置，自动合并无冲突。
+- 词库与流式互不干扰：词库是转写后处理（替换 + 润色提示词），
+  流式是转写本身（实时会话）；流式回落上传时同样走词库的替换层。

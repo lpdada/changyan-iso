@@ -1,43 +1,6 @@
 import Foundation
 import os
 
-/// Server-side speaker confirmation state, carried verbatim from the
-/// streaming contract's `speaker_status` field.
-enum StreamingSpeakerStatus: String, Sendable {
-    case provisional
-    case confirmed
-    case uncertain
-}
-
-/// One segment affected by a `speaker_update` frame, keyed by the
-/// contract's `segment_id` (never by list position).
-struct StreamingSpeakerUpdateSegment: Sendable {
-    let segmentID: String
-    let speakerLabel: String?
-}
-
-/// Failure of the streaming connection. A server `error` frame keeps its
-/// `code` verbatim: the session layer matches
-/// `streaming_unsupported_language` on it to fall back to the old path,
-/// so this type must never rewrite or localise the code.
-enum StreamingError: Error, Sendable {
-    case transport(String)
-    case server(code: String, message: String)
-
-    /// The server error code, if this failure came from an `error` frame.
-    var serverCode: String? {
-        if case .server(let code, _) = self { return code }
-        return nil
-    }
-
-    var message: String {
-        switch self {
-        case .transport(let text): return text
-        case .server(_, let text): return text
-        }
-    }
-}
-
 /// URLSessionWebSocketTask client for the self-hosted streaming ASR
 /// endpoint. It speaks exactly one wire contract (see `Event`); every
 /// field name below matches the contract, including the snake_case
@@ -52,32 +15,9 @@ enum StreamingError: Error, Sendable {
 /// NOT close the stream (the server may keep going); a transport failure
 /// or `session_end` does finish the stream.
 actor StreamingWebSocketClient {
-    enum Event: Sendable {
-        case ready
-        case interimSegment(
-            segmentID: String,
-            text: String,
-            speakerLabel: String?,
-            start: Double,
-            end: Double
-        )
-        case finalSegment(
-            segmentID: String,
-            text: String,
-            speakerLabel: String?,
-            status: StreamingSpeakerStatus,
-            confidence: Double?,
-            start: Double,
-            end: Double,
-            corrected: Bool
-        )
-        case speakerUpdated(
-            remap: [String: String],
-            segments: [StreamingSpeakerUpdateSegment]
-        )
-        case failed(StreamingError)
-        case sessionEnded
-    }
+    /// The events are declared in `StreamingServerProtocol.swift`, which both
+    /// this client and the dictation session compile against.
+    typealias Event = StreamingServerEvent
 
     private let logger = Logger(category: .selfHostedTranslation)
     private var task: URLSessionWebSocketTask?
@@ -222,63 +162,19 @@ actor StreamingWebSocketClient {
         case .data(let data): text = String(data: data, encoding: .utf8)
         @unknown default: text = nil
         }
-        guard let text, let data = text.data(using: .utf8) else { return }
-        guard let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
+        guard let text, let frame = StreamingServerMessageParser.frame(text) else {
             logger.logError("流式：无法解析服务器帧")
             return
         }
-        switch envelope.type {
-        case "ready":
-            continuation?.yield(.ready)
-        case "interim":
-            guard let segmentID = envelope.segmentID, let segmentText = envelope.text else { return }
-            continuation?.yield(.interimSegment(
-                segmentID: segmentID,
-                text: segmentText,
-                speakerLabel: envelope.speakerLabel,
-                start: envelope.start ?? 0,
-                end: envelope.end ?? 0
-            ))
-        case "final":
-            guard let segmentID = envelope.segmentID, let segmentText = envelope.text else { return }
-            let status: StreamingSpeakerStatus
-            switch envelope.speakerStatus {
-            case "uncertain": status = .uncertain
-            case "provisional": status = .provisional
-            default: status = .confirmed
-            }
-            continuation?.yield(.finalSegment(
-                segmentID: segmentID,
-                text: segmentText,
-                speakerLabel: envelope.speakerLabel,
-                status: status,
-                confidence: envelope.confidence,
-                start: envelope.start ?? 0,
-                end: envelope.end ?? 0,
-                corrected: envelope.corrected ?? false
-            ))
-        case "speaker_update":
-            let segments = (envelope.segments ?? []).map {
-                StreamingSpeakerUpdateSegment(segmentID: $0.segmentID, speakerLabel: $0.speakerLabel)
-            }
-            continuation?.yield(.speakerUpdated(remap: envelope.remap ?? [:], segments: segments))
-        case "error":
-            // Verbatim passthrough: the session matches
-            // `streaming_unsupported_language` on `code` for fallback.
-            // The stream stays open; only the session decides whether
-            // this error is fatal (before ready) or just a status line.
-            continuation?.yield(.failed(.server(
-                code: envelope.code ?? "",
-                message: envelope.message ?? "服务器错误"
-            )))
-        case "session_end":
-            continuation?.yield(.sessionEnded)
+        // An unknown `type` is not an error - it is simply a frame this client
+        // does not consume - so the parse failure above stays the only log line.
+        guard let event = StreamingServerMessageParser.event(from: frame) else { return }
+        continuation?.yield(event)
+        if case .sessionEnded = event {
             if let continuation {
                 self.continuation = nil
                 continuation.finish()
             }
-        default:
-            break
         }
     }
 
@@ -291,48 +187,9 @@ actor StreamingWebSocketClient {
         }
     }
 
-    /// One frame of the streaming contract. All names are the contract's
-    /// names, not Swift-style renames; `speaker_label` is optional
-    /// because interim frames carry null until a speaker is assigned.
-    private struct Envelope: Decodable {
-        let type: String
-        let segmentID: String?
-        let text: String?
-        let speakerLabel: String?
-        let speakerStatus: String?
-        let start: Double?
-        let end: Double?
-        let confidence: Double?
-        let corrected: Bool?
-        let remap: [String: String]?
-        let segments: [EnvelopeSegment]?
-        let code: String?
-        let message: String?
-
-        enum CodingKeys: String, CodingKey {
-            case type
-            case segmentID = "segment_id"
-            case text
-            case speakerLabel = "speaker_label"
-            case speakerStatus = "speaker_status"
-            case start
-            case end
-            case confidence
-            case corrected
-            case remap
-            case segments
-            case code
-            case message
-        }
-
-        struct EnvelopeSegment: Decodable {
-            let segmentID: String
-            let speakerLabel: String?
-
-            enum CodingKeys: String, CodingKey {
-                case segmentID = "segment_id"
-                case speakerLabel = "speaker_label"
-            }
-        }
-    }
 }
+
+/// The dictation session drives the socket through this seam, so its
+/// end-of-audio and failure handling can be tested without a server. The
+/// meeting screen keeps talking to the actor directly.
+extension StreamingWebSocketClient: StreamingServerConnection {}

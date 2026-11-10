@@ -13,8 +13,13 @@ struct MeetingNotesView: View {
     @State private var hasSelfHostedKey = SelfHostedTranscriptionConfig.apiKey != nil
     @State private var showingConfig = false
 
+    /// Upload-path picker: the streaming entry belongs to the dictation socket,
+    /// and `/v1/transcribe` does not know its slug, so it is filtered out here
+    /// rather than failing on the server.
     private var selfHostedModels: [CloudModel] {
-        TranscriptionModelProvider.allCloudModels.filter { $0.provider == .selfHosted }
+        TranscriptionModelProvider.allCloudModels.filter {
+            $0.provider == .selfHosted && !TranscriptionModelProvider.isStreamingModel($0.name)
+        }
     }
 
     var body: some View {

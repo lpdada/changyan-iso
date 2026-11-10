@@ -131,6 +131,14 @@ final class RealtimeDictationCoordinator {
 
     /// The backend that serves this model's realtime socket.
     private static func makeSession(for modelName: String) -> any RealtimeDictationSession {
+        // The self-hosted endpoint reuses the meeting screen's client verbatim:
+        // same socket, same auth frame, same frames back.
+        if modelName == TranscriptionModelProvider.selfHostedRealtimeModel {
+            return SelfHostedRealtimeSession(
+                serverURL: SelfHostedTranscriptionConfig.serverURL,
+                connection: StreamingWebSocketClient()
+            )
+        }
         if TranscriptionModelProvider.isDeepgramFluxModel(modelName) {
             return DeepgramFluxRealtimeSession(modelName: modelName)
         }
@@ -155,6 +163,13 @@ final class RealtimeDictationCoordinator {
     /// Realtime models come from several providers with separate keys, so the key
     /// is resolved from the model rather than assumed to be Soniox's.
     private static func apiKey(for modelName: String, keychain: any KeychainService) -> String? {
+        // The self-hosted server's key is the one the meeting screen already
+        // uses - no second credential, no second setup step. Missing key means
+        // "not handleable" (see `canHandle`), not an error: the upload path
+        // reports it the way it always has.
+        if modelName == TranscriptionModelProvider.selfHostedRealtimeModel {
+            return SelfHostedTranscriptionConfig.apiKey(using: keychain)
+        }
         if TranscriptionModelProvider.isDeepgramFluxModel(modelName)
             || TranscriptionModelProvider.deepgramNovaRealtimeModels.contains(modelName) {
             return AIProvider.deepgram.apiKey

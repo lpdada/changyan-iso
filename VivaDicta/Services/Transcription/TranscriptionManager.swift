@@ -495,10 +495,14 @@ class TranscriptionManager: Transcriber {
             ))
 
         case .selfHosted:
+            // The streaming selection is served by the socket, but this path runs
+            // for the keyboard flow and for the fallback after a dropped socket -
+            // and `/v1/transcribe` does not know the streaming slug. Send the
+            // server's own default batch model instead.
             return .selfHosted(.init(
                 baseURL: SelfHostedTranscriptionConfig.serverURL,
                 apiKey: try requireAPIKey(model),
-                modelName: model.name
+                modelName: TranscriptionModelProvider.asyncEquivalent(of: model.name)
             ))
 
         case .customTranscription:
