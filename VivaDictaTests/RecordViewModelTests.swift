@@ -631,4 +631,115 @@ struct RecordViewModelTests {
         #expect(appGroup.textProcessingErrors.isEmpty)
         withExtendedLifetime(sut) {}
     }
+
+    // MARK: - Personal lexicon (final pass after AI)
+
+    /// Builds a view model whose lexicon reads from the test store instead of the
+    /// process-global container, and that store holds one `词语替换` entry.
+    @MainActor
+    private func makeSUTWithLexicon(
+        original: String,
+        replacement: String,
+        transcriber: MockTranscriber,
+        ai: MockAIProcessingService,
+        appGroup: MockAppGroupBridge
+    ) throws -> (sut: RecordViewModel, container: ModelContainer) {
+        SmartSearchFeature.isEnabled = false
+        let container = try TestModelContainer.makeInMemory()
+        container.mainContext.insert(
+            WordReplacement(originalText: original, replacementText: replacement)
+        )
+        try container.mainContext.save()
+
+        let sut = RecordViewModel(
+            appState: AppState(),
+            modelContainer: container,
+            transcriptionManager: transcriber,
+            aiService: ai,
+            audioRecordingService: MockAudioRecordingService(),
+            audioFileService: DefaultAudioFileService(),
+            prewarmManager: MockAudioPrewarmer(),
+            appGroupBridge: appGroup
+        )
+        let context = container.mainContext
+        sut.applyPersonalLexicon = { ReplacementsService.applyReplacementsIfEnabled(to: $0, context: context, isEnabled: true) }
+        return (sut, container)
+    }
+
+    /// The regression this whole change exists for: the transcript comes through
+    /// with the CJK form, the model "corrects" it right back, and the text the
+    /// keyboard inserts still has to be the user's preferred "muse".
+    @MainActor
+    @Test func personalLexicon_survivesEnhancement_andReachesTheKeyboard() async throws {
+        let transcriber = MockTranscriber(currentMode: parakeetMode(), stubbedText: "缪斯 是我最喜欢的乐队")
+        let ai = MockAIProcessingService()
+        ai.stubIsProperlyConfigured = true
+        ai.stubEnhanceResult = .success(("缪斯 是我最喜欢的乐队。", 0.1, "Regular"))
+        let appGroup = MockAppGroupBridge()
+        let (sut, container) = try makeSUTWithLexicon(
+            original: "缪斯",
+            replacement: "muse",
+            transcriber: transcriber,
+            ai: ai,
+            appGroup: appGroup
+        )
+
+        await sut.transcribeSpeechTask(recordURL: try makeDummyAudioFile(), modelContext: container.mainContext).value
+
+        #expect(ai.enhanceCallCount == 1)
+        #expect(appGroup.sharedTranscribedTexts == ["muse 是我最喜欢的乐队。"])
+        let saved = try container.mainContext.fetch(FetchDescriptor<Transcription>())
+        #expect(saved.count == 1)
+        // Saved and shared text agree, so the note and the keyboard never disagree.
+        #expect(saved.first?.enhancedText == "muse 是我最喜欢的乐队。")
+    }
+
+    /// The voice-instruction path returns rewritten text straight to the keyboard,
+    /// so it needs the same final pass.
+    @MainActor
+    @Test func personalLexicon_appliesToVoiceInstructionResult() async throws {
+        let transcriber = MockTranscriber(currentMode: parakeetMode(), stubbedText: "make this more formal")
+        let ai = MockAIProcessingService()
+        ai.stubGenerateVariationResult = .success(("缪斯 的专辑非常好。", 0.2))
+        let appGroup = MockAppGroupBridge()
+        let (sut, container) = try makeSUTWithLexicon(
+            original: "缪斯",
+            replacement: "muse",
+            transcriber: transcriber,
+            ai: ai,
+            appGroup: appGroup
+        )
+
+        await sut.transcribeSpeechTask(
+            recordURL: try makeDummyAudioFile(),
+            modelContext: container.mainContext,
+            sourceTag: SourceTag.keyboard,
+            destination: .voiceInstruction(targetText: "缪斯 的专辑不错", modeName: "Parakeet")
+        ).value
+
+        #expect(appGroup.textProcessingResults == ["muse 的专辑非常好。"])
+    }
+
+    /// No lexicon entry means the final pass is a no-op - the enhancement output
+    /// is shared exactly as the model returned it.
+    @MainActor
+    @Test func personalLexicon_emptyStore_leavesEnhancedTextUntouched() async throws {
+        let transcriber = MockTranscriber(currentMode: parakeetMode(), stubbedText: "缪斯 是我最喜欢的乐队")
+        let ai = MockAIProcessingService()
+        ai.stubIsProperlyConfigured = true
+        ai.stubEnhanceResult = .success(("缪斯 是我最喜欢的乐队。", 0.1, "Regular"))
+        let appGroup = MockAppGroupBridge()
+        // The store's only entry ("unused") matches nothing in the text.
+        let (sut, container) = try makeSUTWithLexicon(
+            original: "unused",
+            replacement: "unused",
+            transcriber: transcriber,
+            ai: ai,
+            appGroup: appGroup
+        )
+
+        await sut.transcribeSpeechTask(recordURL: try makeDummyAudioFile(), modelContext: container.mainContext).value
+
+        #expect(appGroup.sharedTranscribedTexts == ["缪斯 是我最喜欢的乐队。"])
+    }
 }

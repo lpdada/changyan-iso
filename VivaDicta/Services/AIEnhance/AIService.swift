@@ -1495,7 +1495,23 @@ class AIService {
         return ChineseScriptPreferenceStore.current.systemMessageSuffix ?? ""
     }
 
-    private func getSystemMessage(compact: Bool = false) -> String {
+    /// The blocks appended after the preset template on an enhancement request:
+    /// custom vocabulary (terms the recognizer is biased toward), the user's
+    /// personal lexicon, clipboard context, and the Chinese script hint.
+    ///
+    /// The lexicon block tells the model which spellings the user prefers
+    /// (Settings → 词语替换, e.g. "缪斯 → muse"), so it preserves them instead of
+    /// "correcting" them away. It is empty - and the prompt therefore unchanged -
+    /// when the feature is off or no entry is enabled.
+    ///
+    /// Internal rather than private so tests can assert the composition without
+    /// a provider round trip.
+    ///
+    /// - Parameter lexiconSection: The rendered lexicon block. Defaults to the
+    ///   SwiftData-backed lookup.
+    func enhancePromptContextSections(
+        lexiconSection: String = ReplacementsService.lexiconPromptBlock()
+    ) -> String {
         var customVocabularySection = ""
         let customVocabularyWords = CustomVocabulary.getTerms()
         if !customVocabularyWords.isEmpty {
@@ -1508,6 +1524,10 @@ class AIService {
             clipboardContextSection = "\n\n<CLIPBOARD_CONTEXT>\n\(clipboardText)\n</CLIPBOARD_CONTEXT>"
         }
 
+        return customVocabularySection + lexiconSection + clipboardContextSection + resolvedChineseScriptSuffix()
+    }
+
+    private func getSystemMessage(compact: Bool = false) -> String {
         let preset: Preset?
         if let presetId = selectedMode.presetId {
             preset = presetManager?.preset(for: presetId)
@@ -1518,8 +1538,7 @@ class AIService {
         let promptInstructions = preset?.promptInstructions ?? ""
         let useSystemTemplate = preset?.useSystemTemplate ?? true
 
-        let scriptSuffix = resolvedChineseScriptSuffix()
-        let contextSections = customVocabularySection + clipboardContextSection + scriptSuffix
+        let contextSections = enhancePromptContextSections()
 
         if useSystemTemplate {
             let template = compact

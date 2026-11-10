@@ -231,9 +231,11 @@ class TranscriptionManager: Transcriber {
             result = TextFormatter.format(result)
         }
 
-        if UserDefaults.standard.object(forKey: UserDefaultsStorage.Keys.isReplacementsEnabled) as? Bool ?? true {
-            result = ReplacementsService.applyReplacements(to: result)
-        }
+        // First lexicon pass. The AI step runs after this one, which is why the
+        // rules are applied again to the enhanced text (see
+        // ``RecordViewModel/applyPersonalLexicon``) - the toggle lives in
+        // `ReplacementsService` so both layers read it the same way.
+        result = ReplacementsService.applyReplacementsIfEnabled(to: result)
 
         if UserDefaults.standard.object(forKey: UserDefaultsStorage.Keys.isStripTrailingPeriodEnabled) as? Bool ?? false {
             result = TranscriptionOutputFilter.stripTrailingPeriods(result)

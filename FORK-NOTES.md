@@ -472,3 +472,30 @@ Watch 目录，产物只含主 App + 键盘（40MB），Sideloadly 免费 Apple 
   输入过长时截取前 10000 字并在输入中注明是截取的部分内容。
 - 首版 CI 编译失败（BatchSummarySheet 里 @State error 与 catch 隐式
   error 同名遮蔽），改名 errorMessage 后重打。
+
+## fork28（2026-11-10）：个人词库端到端生效（词语替换改完不再被 AI 改回去）
+
+- 现象：在 设置 → 词语替换 里加了「缪斯 → muse」，键盘语音输入出稿后仍可能是
+  「缪斯」。原因是替换在转写管线里跑，而 AI 润色排在它后面，模型会把
+  「缪斯」当成错字"顺手改回去"，改回去的文本才是最终被分享、被插入的文本。
+- 修法（两层，都认同一个总开关 `isReplacementsEnabled`）：
+  1. 提示词层：把**已启用**的词条按 `<PERSONAL_LEXICON>` 段追加进 AI 润色的
+     system message，要求模型保留用户要的写法。最多 50 条 / 600 字符，
+     去重，条目为空或全部禁用时这一段完全不出现（提示词与改动前逐字节一致）。
+  2. 兜底层：AI 输出之后再跑一次同一套替换，落在保存 / 分享给键盘 / 插入之前，
+     模型怎么改都改不掉。
+- 覆盖的插入路径：听写主流程（`transcribeSpeechTask`）、键盘文本处理
+  （`handleKeyboardTextProcessingRequest`，含预设改写）、语音指令
+  「说出来改」（`applyVoiceInstruction`）。
+- 文件：新增
+  `Modules/TextProcessing/Sources/TextProcessing/PersonalLexicon.swift`（纯渲染，
+  可单测）；改 `VivaDicta/Services/ReplacementsService.swift`（总开关、
+  `applyReplacementsIfEnabled`、`lexiconPromptBlock`、可注入 context、按
+  `dateAdded` 排序）、`VivaDicta/Services/AIEnhance/AIService.swift`
+  （`enhancePromptContextSections`）、`VivaDicta/Views/RecordViewModel.swift`
+  （`applyPersonalLexicon` 最后一层）、
+  `VivaDicta/Services/Transcription/TranscriptionManager.swift`（总开关收口）。
+- 存储与 UI 不动：还是 设置 → 词语替换，`WordReplacement` 模型形状不变，不新增设置页。
+- 测试：新增 `VivaDictaTests/PersonalLexiconTests.swift`、
+  `Modules/TextProcessing/Tests/TextProcessingTests/PersonalLexiconPromptBlockTests.swift`，
+  并在 `RecordViewModelTests` 补三条（润色后仍替换、语音指令结果替换、空词库不动）。

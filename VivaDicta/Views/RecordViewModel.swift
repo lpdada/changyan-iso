@@ -112,6 +112,19 @@ class RecordViewModel: NSObject, AVAudioPlayerDelegate {
     public let transcriptionManager: any Transcriber
     public let aiService: any AIProcessingService
 
+    /// The last pass of the user's personal lexicon, applied to AI output.
+    ///
+    /// The lexicon (Settings → 词语替换) already runs inside the transcription
+    /// pipeline, but that is *before* enhancement - so a model that "corrects" a
+    /// preferred spelling back ("muse" → "缪斯") would win. Running the same
+    /// rules over the enhanced text, right before it is saved, shared to the
+    /// keyboard or inserted, is what makes the entry stick end to end.
+    ///
+    /// Injectable so tests can point it at their own store; production reads the
+    /// app-wide SwiftData rules and honors the global
+    /// `isReplacementsEnabled` switch (wired in `init`).
+    var applyPersonalLexicon: (String) -> String
+
     var selectedModeName: String {
         get { aiService.selectedModeName }
         set { aiService.selectedModeName = newValue }
@@ -135,6 +148,7 @@ class RecordViewModel: NSObject, AVAudioPlayerDelegate {
         self.transcriptionManager = transcriptionManager ?? appState.transcriptionManager
         self.aiService = aiService ?? appState.aiService
         self.modelContext = ModelContext(modelContainer)
+        self.applyPersonalLexicon = { ReplacementsService.applyReplacementsIfEnabled(to: $0) }
         self.audioRecordingService = audioRecordingService
         self.audioFileService = audioFileService
         self.prewarmManager = prewarmManager
@@ -792,7 +806,10 @@ class RecordViewModel: NSObject, AVAudioPlayerDelegate {
                     do {
                         let (enhanced, enhancementDuration, prompt) = try await aiService.enhance(transcribedText)
 
-                        enhancedText = enhanced
+                        // Final lexicon pass: the prompt asks the model to keep
+                        // the user's spellings, and this guarantees it - the text
+                        // saved here is the text shared to the keyboard.
+                        enhancedText = applyPersonalLexicon(enhanced)
                         promptName = prompt
                         enhancementDur = enhancementDuration
 
@@ -1009,7 +1026,10 @@ class RecordViewModel: NSObject, AVAudioPlayerDelegate {
                 return
             }
             isAwaitingVoiceInstructionResult = false
-            appGroupBridge.shareTextProcessingResult(result)
+            // Same final lexicon pass as the dictation path: the rewritten text
+            // goes straight into the keyboard, so a preferred spelling the model
+            // "corrected" away must come back here too.
+            appGroupBridge.shareTextProcessingResult(applyPersonalLexicon(result))
         } catch {
             logger.logError("🗣️ Voice instruction failed: \(error.localizedDescription)")
             failPendingVoiceInstruction(error.localizedDescription)
@@ -1703,16 +1723,18 @@ class RecordViewModel: NSObject, AVAudioPlayerDelegate {
         Task {
             defer { aiService.selectedMode = previousMode }
             do {
-                let result: String
+                let aiResult: String
                 // If a preset ID is specified, use generateVariation with that preset
                 if let presetId = pending.presetId,
                    let preset = aiService.presetManager?.preset(for: presetId) {
                     let (text, _) = try await aiService.generateVariation(text: pending.text, preset: preset)
-                    result = text
+                    aiResult = text
                 } else {
                     let (text, _, _) = try await aiService.enhance(pending.text)
-                    result = text
+                    aiResult = text
                 }
+                // Final lexicon pass - this text is inserted by the keyboard.
+                let result = applyPersonalLexicon(aiResult)
                 logger.logInfo("📝 Text processing completed, result length: \(result.count)")
                 if result.isEmpty {
                     logger.logError("📝 Text processing returned empty result")

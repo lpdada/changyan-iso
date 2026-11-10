@@ -200,6 +200,14 @@ Checks if text contains characters from non-spaced scripts:
 
 If any character is in these ranges → no word boundaries used.
 
+**Two layers, one toggle.** Stage 3 runs *before* AI processing, so a model is free to
+undo a replacement ("缪斯" → "muse" → back to "缪斯"). The same rules are therefore used
+twice: the enabled entries are listed in the enhance prompt (see *Personal Lexicon
+Integration*), and `ReplacementsService.applyReplacementsIfEnabled()` runs again over the
+AI output in `RecordViewModel` before it is saved, shared to the keyboard or inserted.
+Both layers read `isReplacementsEnabled`, so an empty or disabled lexicon leaves the text
+and the prompt exactly as they were.
+
 ### Stage 5: AIEnhancementOutputFilter
 
 Removes AI-generated artifacts from enhancement output.
@@ -237,7 +245,9 @@ Applied when inserting transcribed text via the keyboard extension. Not part of 
 |-------|--------|---------|
 | TranscriptionOutputFilter | Always on | — |
 | TextFormatter | `VivaMode.isAutoTextFormattingEnabled` | `true` |
-| ReplacementsService | `UserDefaults.isReplacementsEnabled` | `true` |
+| ReplacementsService (before AI) | `UserDefaults.isReplacementsEnabled` | `true` |
+| Personal lexicon prompt block | `UserDefaults.isReplacementsEnabled` + ≥1 enabled entry | — |
+| ReplacementsService (final pass, after AI) | `UserDefaults.isReplacementsEnabled` | `true` |
 | AI Processing | `VivaMode.aiEnhanceEnabled` + properly configured | `false` |
 | AI Output Filter | Always on (when AI used) | — |
 | Smart Insertion | `VivaMode.isSmartInsertEnabled` | `true` |
@@ -252,6 +262,33 @@ Custom vocabulary words (`VocabularyWord` SwiftData model, CloudKit-synced) are 
 ```
 
 This helps the AI correct transcription errors where phonetically similar words were misrecognized. The system prompt instructs the AI to prioritize vocabulary terms over transcript text when phonetic matches are detected.
+
+## Personal Lexicon Integration (词语替换)
+
+Word replacements double as the user's personal lexicon: an entry `缪斯 → muse` means "I
+said muse, the recognizer wrote 缪斯, and I want muse in the text". Because enhancement runs
+*after* the replacement stage, the entries are also injected into the enhance system
+message:
+
+```
+<PERSONAL_LEXICON>The speaker's preferred spellings. Wherever the left form appears …:
+缪斯 => muse
+</PERSONAL_LEXICON>
+```
+
+- Rendered by `PersonalLexicon.promptBlock(terms:)`
+  (`Modules/TextProcessing/Sources/TextProcessing/PersonalLexicon.swift`); the entries come
+  from `ReplacementsService.lexiconPromptBlock(context:)`.
+- Only `isEnabled` entries are listed; comma-separated originals expand to one pair each.
+- Bounded: at most 50 pairs and 600 characters, duplicates dropped - so the prompt stays
+  compact (important for the CoreML model, whose compact prompt is time-to-first-token
+  sensitive).
+- The block is empty - and the system message byte-for-byte unchanged - when the lexicon is
+  empty, fully disabled, or when `isReplacementsEnabled` is off.
+
+The prompt is advisory; the guarantee is the deterministic second pass over the AI output
+(`RecordViewModel.applyPersonalLexicon`), which runs on the dictation path, the
+keyboard rewrite path and the voice-instruction ("speak to edit") path.
 
 ## Stage 4 detail: AI prompt construction
 
@@ -272,10 +309,11 @@ Some cloud transcription providers format text before it reaches the local pipel
 | `TranscriptionOutputFilter` | `Modules/TextProcessing/Sources/TextProcessing/TranscriptionOutputFilter.swift` |
 | `TextFormatter` | `Modules/TextProcessing/Sources/TextProcessing/TextFormatter.swift` |
 | `ReplacementsService` | `VivaDicta/Services/ReplacementsService.swift` |
+| `PersonalLexicon` (prompt block) | `Modules/TextProcessing/Sources/TextProcessing/PersonalLexicon.swift` |
 | `CustomVocabulary` | `VivaDicta/Utilities/CustomVocabulary.swift` |
 | `PromptsTemplates` | `VivaDicta/Services/AIEnhance/PromptsTemplates.swift` |
 | `AIService` (`formatTranscriptForLLM`) | `VivaDicta/Services/AIEnhance/AIService.swift` |
 | `AIEnhancementOutputFilter` | `Modules/AICore/Sources/AICore/AIEnhancementOutputFilter.swift` |
 | `TextInsertionFormatter` | `VivaDictaKeyboard/TextInsertionFormatter.swift` |
 
-**Called from (key paths):** the `TranscriptionOutputFilter.filter()` + `hasMeaningfulContent()` gate runs in `RecordViewModel` / `WatchAudioProcessor` before save; `TextFormatter.format()` in `TranscriptionManager.transcribe()` and after AI output (Assistant preset only); `ReplacementsService.applyReplacements()` in `TranscriptionManager.transcribe()`; `AIEnhancementOutputFilter.filter()` on every AI response; `TextInsertionFormatter` in `KeyboardViewController.handleTranscription()`.
+**Called from (key paths):** the `TranscriptionOutputFilter.filter()` + `hasMeaningfulContent()` gate runs in `RecordViewModel` / `WatchAudioProcessor` before save; `TextFormatter.format()` in `TranscriptionManager.transcribe()` and after AI output (Assistant preset only); `ReplacementsService.applyReplacements()` in `TranscriptionManager.transcribe()` and again on AI output in `RecordViewModel`; `AIEnhancementOutputFilter.filter()` on every AI response; `TextInsertionFormatter` in `KeyboardViewController.handleTranscription()`.
