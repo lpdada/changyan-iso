@@ -31,6 +31,9 @@ protocol AppGroupBridge: AnyObject {
     func shareTextProcessingResult(_ text: String)
     func shareTextProcessingError(_ message: String)
     func refreshKeyboardSessionExpiry(timeoutSeconds: Int)
+    /// 标记「这次录音是键盘发起的」——键盘离场期间完成的转录靠它判断
+    /// 能不能补插回宿主输入框（fork28）。
+    func markKeyboardDictationStarted()
     func getAndConsumePendingTextProcessing() -> (text: String, modeName: String, presetId: String?)?
     func getAndConsumePendingVoiceInstruction() -> (targetText: String, modeName: String)?
     func clearPendingVoiceInstruction()

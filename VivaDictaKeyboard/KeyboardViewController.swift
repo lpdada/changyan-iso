@@ -70,8 +70,54 @@ class KeyboardViewController: KeyboardInputViewController {
         Task { @MainActor [weak self] in
             await AppGroupCoordinator.shared.reconcileRecordingState()
             guard let self else { return }
-            dictationState.isSessionActive = AppGroupCoordinator.shared.isKeyboardSessionActive
+            dictationState.resyncFromCoordinator()
+            await pickUpMissedTranscription()
         }
+        startStatePolling()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        statePollTask?.cancel()
+        statePollTask = nil
+    }
+
+    // MARK: - State Polling (fork28)
+
+    /// 键盘可见期间的定时对账任务。
+    private var statePollTask: Task<Void, Never>?
+
+    /// 每 0.8 秒把主 App 的真值拉回 UI 状态。
+    ///
+    /// 事件（Darwin 通知）只在「发的那一刻键盘活着且回调还在」时才生效，
+    /// 而录音状态通知整场只发一次；微信里点话筒最常见的时序恰好是
+    /// 微信 → 畅言（前台起录音）→ 微信，键盘在这段窗口里被挂起，通知直接丢。
+    /// 只靠事件，键盘就整场停在普通界面（没有录音界面、没有停止按钮），
+    /// 主 App 却在后台一直录——这就是「点了没反应，后台却录上了」。
+    /// 轮询不依赖事件，丢掉的状态最迟 0.8 秒后自己回来。
+    private func startStatePolling() {
+        statePollTask?.cancel()
+        statePollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await AppGroupCoordinator.shared.pollKeyboardState()
+                self.dictationState.resyncFromCoordinator()
+                // 没有热麦会话时不需要这么勤：主 App 多半没在跑，拉取要等
+                // URLSession 超时，4 秒一次足够等到会话被激活那一刻。
+                let hasSession = self.dictationState.isSessionActive || self.dictationState.isRecording
+                try? await Task.sleep(for: .milliseconds(hasSession ? 800 : 4000))
+            }
+        }
+    }
+
+    /// 键盘离场期间跑完的那次转录：结果槽里还有没被取走的文本，出现时补插。
+    private func pickUpMissedTranscription() async {
+        guard dictationState.uiState != .recording else { return }
+        guard let text = await AppGroupCoordinator.shared.takePendingKeyboardTranscription(),
+              !text.isEmpty else { return }
+        logger.logNotice("⌨️ 补插键盘离场期间完成的转录（\(text.count) 字）")
+        dictationState.transcriptionStatus = .completed
+        handleTranscription(text)
     }
 
     override func viewDidLoad() {
