@@ -254,6 +254,9 @@ struct AddAPIKeyView: View {
             
             HapticManager.mediumImpact()
             
+            // 粘贴常带首尾空格/换行，服务端会因此 401；先去空白再校验和保存。
+            // （剪贴板按钮自己会 trim，但工具栏对勾走的是这里的原文。）
+            apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             let isValid = await aiService.saveAPIKey(apiKey, for: provider)
             
             isVerifying = false

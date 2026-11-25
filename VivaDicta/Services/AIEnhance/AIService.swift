@@ -2012,6 +2012,8 @@ class AIService {
             return await verifyVercelAIGatewayAPIKey(key)
         case .opencodeZen:
             return await verifyOpencodeZenAPIKey(key)
+        case .opencodeGo:
+            return await verifyOpencodeGoAPIKey(key)
         default:
             // OpenAI-compatible providers fall through to the chat-completions
             // probe. Today that covers OpenAI, Groq, OpenRouter, Z.AI, Kimi,
@@ -2058,6 +2060,21 @@ class AIService {
             key,
             url: URL(string: "https://opencode.ai/zen/v1/models")!,
             providerName: AIProvider.opencodeZen.rawValue
+        )
+    }
+
+    /// Go cannot use the chat probe either: it runs against the fixed default
+    /// model `qwen3.8-max`, and a workspace that never opted into China
+    /// hosting gets 403 RegionError on it even with a perfectly good key
+    /// (the DeepSeek v4 builds have the same gate). The model listing only
+    /// checks the key itself - 401 for a bad key, 200 for any real one
+    /// (verified 2026-11-26: bad key 401, no key 200, so a key must be sent).
+    private func verifyOpencodeGoAPIKey(_ key: String) async -> Bool {
+        let service = OpenAICompatibleService(networkService: networkService, logger: logger)
+        return await service.verifyGETEndpoint(
+            key,
+            url: URL(string: "https://opencode.ai/zen/go/v1/models")!,
+            providerName: AIProvider.opencodeGo.rawValue
         )
     }
 
