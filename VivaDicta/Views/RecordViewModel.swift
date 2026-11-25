@@ -294,6 +294,11 @@ class RecordViewModel: NSObject, AVAudioPlayerDelegate {
             }
 
             activeSourceTag = sourceTag
+            // 键盘发起的录音打个标记：键盘离场期间完成的转录，靠它区分
+            // 「键盘这次听写」与「主 App 自己录的」，补插时才不会串框（fork28）。
+            if sourceTag == SourceTag.keyboard {
+                appGroupBridge.markKeyboardDictationStarted()
+            }
             // Clear any stale selection now; the filter-inherited tags are seeded only
             // once capture has actually started, so failed/denied starts leave it empty.
             pendingTagIds.removeAll()
@@ -1572,7 +1577,15 @@ class RecordViewModel: NSObject, AVAudioPlayerDelegate {
                 if voiceInstruction != nil {
                     self.isAwaitingVoiceInstructionResult = true
                     self.failPendingVoiceInstruction("Could not start recording. Open Changyan and try again.")
+                } else if !self.prewarmManager.isSessionActive {
+                    // 真的起不来（热麦会话没了）：静默 return 会让键盘整场停在
+                    // 普通界面，用户只看到「点了没反应」（fork28）。明确回一条
+                    // 错误，键盘弹提示并自动消失，比干等强。
+                    self.logger.logError("❌ 键盘请求开始录音失败：热麦会话已失效，state=\(String(describing: self.recordingState))")
+                    self.appGroupBridge.updateTranscriptionError("录音没能启动，请再点一次话筒")
                 }
+                // 已在录音时的重复开始请求（键盘界面没跟上、用户又点了一次）
+                // 不算失败：键盘会在下一次状态对账里变成录音态。
                 return
             }
 

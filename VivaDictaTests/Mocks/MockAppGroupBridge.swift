@@ -42,6 +42,9 @@ final class MockAppGroupBridge: AppGroupBridge {
     func shareTextProcessingError(_ message: String) { textProcessingErrors.append(message) }
     func refreshKeyboardSessionExpiry(timeoutSeconds: Int) { refreshKeyboardSessionExpiryCalls.append(timeoutSeconds) }
 
+    private(set) var keyboardDictationStartedCount = 0
+    func markKeyboardDictationStarted() { keyboardDictationStartedCount += 1 }
+
     func getAndConsumePendingTextProcessing() -> (text: String, modeName: String, presetId: String?)? {
         defer { stubPendingTextProcessing = nil }
         return stubPendingTextProcessing

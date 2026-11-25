@@ -132,10 +132,21 @@ final class KeyboardDictationState {
     }
 
     // MARK: - Lifecycle
+
+    /// 当前占着 coordinator 回调槽的那个实例（fork28）。
+    ///
+    /// `stop()` 是异步的（`Task { @MainActor }`）：旧键盘界面销毁时排队的
+    /// 清理动作，可能落在新界面 `start()` 之后，把新实例刚装上的回调全部
+    /// 抹掉。抹掉之后新键盘就聋了——点话筒照旧能发出开始录音（那是直接
+    /// 调用 coordinator），主 App 也真的开始录，但录音态/转录结果再也传不
+    /// 回来：界面不动、字也不插。只有它自己还是槽的主人时才允许清。
+    private static weak var callbackOwner: KeyboardDictationState?
+
     func start() {
         // Refresh VivaModes when keyboard starts
         vivaModeManager.refreshVivaModes()
 
+        Self.callbackOwner = self
         AppGroupCoordinator.shared.onRecordingStateChanged = { [weak self] state in
             self?.isRecording = state
         }
@@ -182,6 +193,10 @@ final class KeyboardDictationState {
     
     nonisolated func stop() {
         Task { @MainActor in
+            // 已被更新的键盘实例接管时什么都不做：否则会把它的回调抹掉，
+            // 让新键盘变成「能发指令、收不到状态」（fork28）。
+            guard Self.callbackOwner === self else { return }
+            Self.callbackOwner = nil
             AppGroupCoordinator.shared.onRecordingStateChanged = nil
             AppGroupCoordinator.shared.onKeyboardSessionActivated = nil
             AppGroupCoordinator.shared.onKeyboardSessionExpired = nil
@@ -195,6 +210,24 @@ final class KeyboardDictationState {
             AppGroupCoordinator.shared.onTextProcessingError = nil
             errorDismissTask?.cancel()
             errorDismissTask = nil
+        }
+    }
+
+    /// 把 coordinator（桥模式下是主 App 的状态快照）里的真值同步进 UI 状态。
+    ///
+    /// 这个方法是「拉」的那条腿：Darwin 通知丢了、键盘进程被挂起过、
+    /// 回调被旧实例清空过，只要键盘还看得见，下一次轮询就能把界面纠回来。
+    /// 调用前应先 `await pollKeyboardState()` 让缓存是新值。
+    func resyncFromCoordinator() {
+        let coordinator = AppGroupCoordinator.shared
+        let recording = coordinator.isRecording
+        if isRecording != recording { isRecording = recording }
+        let active = coordinator.isKeyboardSessionActive
+        if isSessionActive != active { isSessionActive = active }
+        let status = coordinator.transcriptionStatus
+        if transcriptionStatus != status { transcriptionStatus = status }
+        if currentAudioLevel != coordinator.currentAudioLevel {
+            currentAudioLevel = coordinator.currentAudioLevel
         }
     }
 

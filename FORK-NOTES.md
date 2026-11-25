@@ -472,3 +472,31 @@ Watch 目录，产物只含主 App + 键盘（40MB），Sideloadly 免费 Apple 
   输入过长时截取前 10000 字并在输入中注明是截取的部分内容。
 - 首版 CI 编译失败（BatchSummarySheet 里 @State error 与 catch 隐式
   error 同名遮蔽），改名 errorMessage 后重打。
+
+## fork28（2026-11-17）：修「微信里点话筒不翻红、后台却在录」——状态同步改成事件 + 定时收敛
+
+- 现象（用户实测）：微信里点键盘话筒转录，键盘不出现录音/转录界面，主 App
+  却在后台真的录上了；把主 App 杀掉重开再点又正常，偶发。
+- 根因不在传输层，在「谁负责把状态纠回来」：键盘的录音态是边沿触发的——
+  只有收到那一刻的 Darwin 通知才更新 UI，而录音状态通知整场只发一次。
+  微信里点话筒的必经时序是「微信 → 畅言前台起录音 → 回微信」，键盘进程
+  在这段窗口里被挂起，通知直接丢；恢复后 `viewWillAppear` 的对账
+  （fork24 加的）能覆盖一部分，但通知丢失 + 回调被旧实例清空 + 主 App
+  静默拒绝开始这三条任一命中，键盘就整场停在普通界面：没有停止按钮，
+  转录完成后文本也没人消费。
+- 修法（四处，全部是「拉」而不是「推」）：
+  1. 键盘可见期间定时对账：`KeyboardViewController.startStatePolling()`
+     每 0.8s（无热麦会话时 4s）调 `pollKeyboardState()`，
+     `KeyboardDictationState.resyncFromCoordinator()` 把录音态/会话/
+     转录状态/电平从 coordinator 同步进 UI。通知丢了也不影响收敛。
+  2. 回调槽所有权：`KeyboardDictationState.stop()` 先确认自己还是槽的主人
+     （`callbackOwner`）再清，否则旧键盘的异步清理会把新键盘的回调抹掉，
+     新键盘于是「能发指令、收不到状态」。
+  3. 拉取节流：电平通知 0.2s 一条，原来每条都发一次回环 HTTP；加 300ms
+     节流闸（一次性事件用 `forcing: true` 绕过），避免主 actor 被打满。
+  4. 补插与自愈：`takePendingKeyboardTranscription()` 在键盘重新出现时
+     取走「键盘离场期间完成」的转录（只认键盘发起、120s 内、按消费水位
+     去重），解决「主 App 有记录、输入框没字」；连续 3 次拉不到主 App
+     就清掉残留录音态（红麦克点不动的那种死状态）。主 App 侧开始录音
+     失败不再静默 return，改为回一条错误让键盘弹提示。
+- 未动：音频链路、prewarm 引擎、转写与 AI 处理、桥的 HTTP/剪贴板通道本身。

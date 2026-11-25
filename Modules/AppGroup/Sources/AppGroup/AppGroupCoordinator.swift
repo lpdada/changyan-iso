@@ -106,6 +106,10 @@ public final class AppGroupCoordinator: @unchecked Sendable {
         static let audioLevel = "audioLevel" // 0.0 ... 1.0
         static let transcriptionErrorMessage = "transcriptionErrorMessage"
         static let keyboardClipboardContext = "keyboardClipboardContext"
+        // 键盘发起的那次录音的开始时刻。键盘离场期间跑完的转录靠它判断
+        // 「这条结果是键盘这次听写的」还是「主 App 自己录的」，避免把
+        // 主 App 里的录音补插到微信输入框（fork28）。
+        static let keyboardDictationStartedAt = "keyboardDictationStartedAt"
 
         // Text processing (keyboard rewrite feature)
         static let textProcessingInput = "textProcessingInput"
@@ -264,6 +268,7 @@ public final class AppGroupCoordinator: @unchecked Sendable {
                         UserDefaultsKeys.audioLevel,
                         UserDefaultsKeys.keyboardSessionExpiryTime,
                         UserDefaultsKeys.lastRecordingTimestamp,
+                        UserDefaultsKeys.keyboardDictationStartedAt,
                     ],
                     dataKeys: [],
                     arrayKeys: []
@@ -318,18 +323,54 @@ public final class AppGroupCoordinator: @unchecked Sendable {
     /// 扩展进程：把状态快照拉回本地缓存（录音状态/电平/会话）。
     /// 在依赖这些值的通知 handler 之前调用，保证随后走的原有读取逻辑命中新值。
     /// 返回值说明缓存是否可信：非桥模式或主 App 进程里直接返回 true；
+    /// 桥状态拉取的节流闸（fork28）。
+    ///
+    /// 电平通知每 0.2 秒一条，原来每条都要发一次回环 HTTP；一起流进来的
+    /// 还有键盘可见期间的轮询，两者叠加会把扩展的主 actor 和回环连接打满，
+    /// 打字跟着发涩。300ms 内的重复请求直接复用上一次结果。
+    private let bridgePullGate = NSLock()
+    private var lastBridgePullAt: TimeInterval = 0
+    private var lastBridgePullResult = true
+
+    /// `NSLock.lock()` 在 Swift 6 里标了 `noasync`，异步函数里直接调是编译错误，
+    /// 所以加锁动作放进这两个同步小函数里。
+    private func bridgePullIsReusable(now: TimeInterval, forcing: Bool) -> (reusable: Bool, result: Bool) {
+        bridgePullGate.lock()
+        defer { bridgePullGate.unlock() }
+        return (!forcing && (now - lastBridgePullAt) < 0.3, lastBridgePullResult)
+    }
+
+    private func noteBridgePull(succeeded: Bool) {
+        bridgePullGate.lock()
+        defer { bridgePullGate.unlock() }
+        lastBridgePullAt = Date().timeIntervalSince1970
+        lastBridgePullResult = succeeded
+    }
+
+    /// 扩展进程：把状态快照拉回本地缓存（录音状态/电平/会话）。
+    /// 在依赖这些值的通知 handler 之前调用，保证随后走的原有读取逻辑命中新值。
+    /// 返回值说明缓存是否可信：非桥模式或主 App 进程里直接返回 true；
     /// 桥模式下拉取失败时返回 false——调用方不能把旧缓存当新值读，
     /// 否则一次失败的拉取会让键盘整场录音都停留在普通界面（主 App
     /// 后台明明在录音），而录音状态通知整场只发一次，不会再纠正。
+    ///
+    /// `forcing` 为 true 时绕过上面的节流闸：录音开始/结束这类一次性事件
+    /// 必须拿新值，复用 300ms 内的旧结果会把那次事件抵消掉。
     @discardableResult
-    private func pullBridgeStateIntoCache() async -> Bool {
+    private func pullBridgeStateIntoCache(forcing: Bool = false) async -> Bool {
         guard LocalBridge.isEnabled, !LocalBridge.isMainAppProcess,
               let defaults = sharedDefaults else { return true }
-        if let snapshot = await BridgeStateClient.pullState() {
-            BridgeStateClient.applySnapshot(snapshot, to: defaults)
-            return true
-        }
-        return false
+
+        let now = Date().timeIntervalSince1970
+        let gate = bridgePullIsReusable(now: now, forcing: forcing)
+        if gate.reusable { return gate.result }
+
+        let snapshot = await BridgeStateClient.pullState()
+        noteBridgePull(succeeded: snapshot != nil)
+
+        guard let snapshot else { return false }
+        BridgeStateClient.applySnapshot(snapshot, to: defaults)
+        return true
     }
 
     /// 键盘侧最近一次递交给 UI 的录音态。电平 tick 对账时用它判断
@@ -340,6 +381,10 @@ public final class AppGroupCoordinator: @unchecked Sendable {
 
     @MainActor private func deliverRecordingState() {
         let recording = isRecording
+        // 回调还没装上（键盘刚起来、或旧的键盘实例把槽清空了）就别记这笔账，
+        // 否则换个实例注册后这个值会被当成「已经递交过」，新实例永远收不到。
+        guard onRecordingStateChanged != nil else { return }
+        guard recording != lastDeliveredRecordingState else { return }
         lastDeliveredRecordingState = recording
         onRecordingStateChanged?(recording)
     }
@@ -362,8 +407,77 @@ public final class AppGroupCoordinator: @unchecked Sendable {
     /// 调用方须先保证回调已注册（键盘在 viewWillAppear 里先重注册
     /// 再调本方法），否则递交会空操作。
     @MainActor public func reconcileRecordingState() async {
-        await pullBridgeStateIntoCache()
+        await pullBridgeStateIntoCache(forcing: true)
+        // 键盘重新出现时是新的 UI 实例（或旧实例的回调刚被清过），
+        // 上一笔「已递交」的账对它无效，清掉才能把当前真值递过去。
+        lastDeliveredRecordingState = nil
         deliverRecordingState()
+    }
+
+    /// 键盘可见期间的定时对账（键盘每 0.8 秒调一次）。
+    ///
+    /// Darwin 通知是边沿触发的，而且录音状态通知整场只发一次：主 App 在
+    /// 后台开录那一刻，键盘进程可能正被挂起（微信 → 畅言 → 微信的深链流程
+    /// 必然经历一次），或者回调刚被旧键盘实例的 `stop()` 清空——这一枪打空
+    /// 就再也没有第二枪，键盘于是整场停在普通界面，主 App 却一直在后台录音
+    /// （微信里点话筒「不翻红」的根因）。轮询不依赖任何事件，是唯一能把
+    /// 丢掉的边沿状态追回来的通道，把状态机从「纯事件驱动」变成
+    /// 「事件驱动 + 定时收敛」。
+    ///
+    /// 顺带做两件通知做不到的事：
+    /// - 电平随每次拉取一起递交（电平通知本身不带值）；
+    /// - 连续 3 次拉不到主 App，就认定主 App 已被系统回收，把残留的录音态
+    ///   清掉——否则键盘永远停在红麦克，点它也没人应答，只能靠重启主 App。
+    @MainActor
+    public func pollKeyboardState() async {
+        let reachable = await pullBridgeStateIntoCache()
+        if reachable {
+            consecutiveBridgePullFailures = 0
+        } else {
+            consecutiveBridgePullFailures += 1
+            if consecutiveBridgePullFailures >= 3, isRecordingRaw {
+                logger.logError("🩺 主 App 连续 \(consecutiveBridgePullFailures) 次不可达，清掉残留录音态")
+                sharedDefaults?.set(false, forKey: UserDefaultsKeys.isRecording)
+                sharedDefaults?.set(Date().timeIntervalSince1970, forKey: UserDefaultsKeys.lastRecordingTimestamp)
+            }
+        }
+        deliverRecordingState()
+        onAudioLevelUpdated?(currentAudioLevel)
+    }
+
+    @MainActor private var consecutiveBridgePullFailures = 0
+
+    /// 主 App 进程：记下「这次录音是键盘发起的」。
+    /// 供 ``takePendingKeyboardTranscription(maxAge:)`` 判断补插的边界，
+    /// 免得把主 App 里自己录的那条补插进宿主输入框。
+    public func markKeyboardDictationStarted() {
+        sharedDefaults?.set(Date().timeIntervalSince1970, forKey: UserDefaultsKeys.keyboardDictationStartedAt)
+    }
+
+    /// 键盘重新出现时，取走「键盘不在场时完成」的那次转录文本。
+    ///
+    /// 完成通知和录音状态通知一样，可能正好落在键盘被挂起的窗口里：结果槽
+    /// 里躺着文本，键盘却再也不会被叫醒，用户看到的就是「主 App 有记录、
+    /// 输入框没字」。这里按完成时刻与消费水位去重，并只认键盘发起、
+    /// `maxAge` 内的新结果。
+    @MainActor
+    public func takePendingKeyboardTranscription(maxAge: TimeInterval = 120) async -> String? {
+        guard LocalBridge.isEnabled, !LocalBridge.isMainAppProcess,
+              let defaults = sharedDefaults else { return nil }
+        // 先拉一次状态，确保 keyboardDictationStartedAt 是主 App 的最新值。
+        await pullBridgeStateIntoCache(forcing: true)
+        let kind = BridgePayloadKind.transcribedText
+        let waterKey = "vdBridgeConsumedAt.\(kind.rawValue)"
+        let startedAt = defaults.double(forKey: UserDefaultsKeys.keyboardDictationStartedAt)
+        guard let pulled = await BridgeStateClient.pullResult(kind: kind),
+              !pulled.value.isEmpty,
+              pulled.at > defaults.double(forKey: waterKey),
+              pulled.at >= startedAt,
+              Date().timeIntervalSince1970 - pulled.at <= maxAge else { return nil }
+        logger.logNotice("⌨️ 补取键盘离场期间完成的转录（\(pulled.value.count) 字）")
+        defaults.set(pulled.at, forKey: waterKey)
+        defaults.set(pulled.value, forKey: UserDefaultsKeys.transcribedText)
+        return getAndConsumeTranscribedText()
     }
 
     /// 主 App 进程：把键盘经剪贴板送来的载荷落地到本地存储。
@@ -1680,14 +1794,15 @@ public final class AppGroupCoordinator: @unchecked Sendable {
 
     private func handleRecordingStateChangedNotification() {
         Task { @MainActor in
-            let pulled = await pullBridgeStateIntoCache()
+            // 这是「录音开始/结束」这一次性事件，强制拉一次，不能吃节流闸的缓存。
+            let pulled = await pullBridgeStateIntoCache(forcing: true)
             deliverRecordingState()
             if !pulled {
                 // 拉取失败时缓存还是旧值，上面递交的可能是错的；而且
                 // 录音状态通知整场只发一次，不补一次就永远错下去。
                 // 1 秒后重拉一次并重新递交，覆盖掉这次错误递交。
                 try? await Task.sleep(for: .seconds(1))
-                if await pullBridgeStateIntoCache() {
+                if await pullBridgeStateIntoCache(forcing: true) {
                     deliverRecordingState()
                 }
             }
